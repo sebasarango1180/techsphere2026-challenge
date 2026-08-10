@@ -488,3 +488,9 @@ pyrightconfig.json
 .ionide
 
 # End of https://www.toptal.com/developers/gitignore/api/linux,macos,python,go,visualstudiocode,intellij+all,node
+
+### Project-specific ###
+# Local copy of the challenge dataset (127MB of PDFs + xlsx) -- not vendored, matches
+# specs/implementation-plan.md §5. Source of truth is the ParticipantArtifacts repo;
+# scripts/setup.sh clones it at setup time. See docs/dataset-eda.md.
+/dataset/

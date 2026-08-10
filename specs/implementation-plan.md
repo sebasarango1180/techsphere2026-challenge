@@ -38,8 +38,8 @@ possible. Treat §6's phase boundaries as safe checkpoints, not scope limits.
 ```mermaid
 flowchart LR
     subgraph Browser
-        Console["Admin console\n(React)"]
-        CallUI["Call interface\n(React + LiveKit JS SDK)"]
+        Console["admin-console app\n(React)"]
+        CallUI["call-interface app\n(React + LiveKit JS SDK)"]
     end
 
     subgraph ControlPlane["Control plane"]
@@ -97,10 +97,18 @@ risks).
 
 ### Service list
 
+Frontend is **two separate apps, not one SPA with two routes** — revised from the initial
+plan. The challenge rules allow either ("pueden ser una sola aplicación o dos"), but
+separate is the more defensible choice once the two surfaces have different audiences and
+(eventually) different auth postures: a patient starting a call never authenticates,
+while an admin console that can delete clinical knowledge is a different trust boundary
+even under this challenge's explicit no-auth scope (§2.7).
+
 | Service | Language/runtime | Responsibility | Talks to |
 |---|---|---|---|
-| `frontend` | React + Vite + TS | Admin console + call interface (can be one SPA, two routes) | `api-gateway`, `livekit` (via JS SDK) |
-| `api-gateway` | Go + Gin | REST control plane: call lifecycle, document CRUD proxy, escalation/summary reads, OpenAPI docs, LiveKit token minting | `postgres`, `vector-store`, `livekit` |
+| `call-interface` | React + Vite + TS | Standalone app: start call, mic, listen, reconnect on drop | `api-gateway`, `livekit` (via JS SDK) |
+| `admin-console` | React + Vite + TS | Standalone app: document CRUD + processing status | `api-gateway` |
+| `api-gateway` | Go + Gin | REST control plane: call lifecycle, document CRUD proxy, escalation/summary reads, OpenAPI docs, LiveKit token minting, schema migrations | `postgres`, `vector-store`, `livekit` |
 | `voice-agent` | Python + `livekit-agents` | Real-time pipeline: VAD → STT → retrieve → generate → decide → TTS; writes turns/escalations/summaries | `livekit`, `vector-store`, `ollama`, `postgres` |
 | `vector-store` | Python + FastAPI + ChromaDB | Ingestion (parse/chunk/embed), hybrid search, versioning, soft delete | `chromadb` (embedded or its own container) |
 | `ollama` | Ollama (Go binary) | Serves Phi-3.5-mini via OpenAI-compatible API; GPU/Metal/CPU auto | — |
@@ -145,10 +153,22 @@ escalation decisions are **never LLM-only**:
    response is done. This is what keeps perceived latency low.
 2. **Track B (classification)** — a concise structured pass (Ollama JSON-mode) over the
    same turn context produces `{triage: verde|amarillo|rojo, confidence, missing_info[],
-   citations[]}`.
-3. **Deterministic red-flag layer** — a rule table (fever thresholds, red-flag symptom
-   keywords/regex per procedure category, e.g. chest pain, wound dehiscence signs, no
-   bowel movement + vomiting) runs on the raw transcript independently of the LLM.
+   citations[], pain_nrs, fever_c, mobility, wound, appetite, sleep}` — the last six
+   mirror the reference dataset's own trajectory taxonomy (docs/dataset-eda.md §3) and
+   feed the running clinical snapshot (§3.1, §2.10), not just the triage decision.
+3. **Deterministic red-flag layer** — scoped narrower than a first pass attempted, after
+   a real mistake surfaced the right boundary: only objective numeric thresholds (an
+   explicit temperature), structurally rigid absence-statements ("no orino", "no puedo
+   apoyar"), low-ambiguity emergency vocabulary (chest pain, heavy bleeding, stated
+   confusion), and a few narrow non-obvious domain correlations (referred shoulder pain
+   post-cholecystectomy). Free-text symptom-*description* pattern matching (what wound
+   discharge sounds like in lay speech) was tried and removed — "lenguaje cotidiano,
+   ambiguo y regional" (the challenge's own framing) is an unbounded paraphrase space,
+   and a regex chasing it just adds false-positive surface without closing the gap; that
+   recognition is Track B's job, grounded by retrieval. See
+   `services/voice-agent/app/decision.py`'s module docstring for the full reasoning and
+   the concrete false positive (a benign sentence mentioning both "herida" and "liquido")
+   that motivated pulling this back.
 4. **Fusion rule**: `final_triage = max(track_B_triage, rule_layer_triage)` — the rule
    layer can only escalate, never downgrade what the model said. Every escalation event
    persists `rationale`, which layer triggered it, and the cited chunk IDs, satisfying
@@ -156,6 +176,11 @@ escalation decisions are **never LLM-only**:
 5. When Track B or the rule layer is ambiguous (low confidence, conflicting signals), the
    agent is prompted to **ask a clarifying question before deciding** rather than
    guessing — directly answers "¿indaga antes de decidir?" from the rubric.
+6. The triage classification is **never spoken to the patient** — the agent leads a
+   routine check-in conversation and privately infers whether staff should be notified;
+   Track B's output drives escalation logic and the call summary, not the dialogue
+   (`app/prompts.py`'s docstring). When escalating, the spoken reply states the next step
+   in plain language, never the verde/amarillo/rojo label itself.
 
 ### 2.4 Hybrid retrieval, versioning, soft delete
 
@@ -168,15 +193,59 @@ escalation decisions are **never LLM-only**:
 - **Identity**: `api-gateway`/Postgres owns `document_id` (source of truth for identity);
   `vector-store` is a processing/index engine, not an ID authority. Every chunk in Chroma
   carries `{document_id, version, status}` metadata.
-- **Versioning**: re-uploading a doc creates a new `document_versions` row and a new
-  Chroma write tagged with the incremented version; old version's chunks flip to
-  `status=superseded`.
+- **Versioning**: `PUT /documents/{id}` (not another `POST /documents`, which always
+  creates a brand-new, unrelated document) uploads a new version of an EXISTING
+  document_id — increments `documents.current_version`, inserts a new
+  `document_versions` row, and re-runs the full extract→chunk→embed pipeline; Chroma's
+  `upsert_chunks` flips the prior version's chunks to `status=superseded`. Verified
+  end-to-end against a real Postgres + ChromaDB (create → search hits v1 → reindex with
+  different content → search hits only v2, v1 content gone). Caught and fixed a real
+  regression this way: an earlier refactor of `UploadDocument` dropped the
+  `document_versions` INSERT entirely, so the immediate post-upload status check
+  returned 404 even though ingestion had genuinely succeeded — `ingestVersion`'s
+  bookkeeping UPDATE now logs loudly if it ever matches zero rows again, specifically
+  because this failure mode is silent by default (an `UPDATE` matching nothing isn't a
+  SQL error).
+- **OCR fallback**: `vector-store` uses PyMuPDF (not `pypdf` — see
+  `services/vector-store/app/chunking.py`'s docstring for why that swap happened, and
+  what it removed) for text extraction, and falls back to `pytesseract` OCR (Spanish +
+  English, `tesseract-ocr-spa`/`tesseract-ocr-eng` in the Dockerfile) when a page has no
+  text layer at all. Verified against the actual scanned PDF in the given corpus
+  (docs/dataset-eda.md §6) — real, usable Spanish medical text comes out, not garbage.
+- **Bulk-loading the given corpus** (`scripts/bulk_ingest_corpus.py`): walks
+  `dataset/textos/*/*.pdf`, maps folder name → category key, POSTs each through
+  api-gateway's real `/documents` endpoint (same path the admin console uses — identity
+  ownership stays with api-gateway). Idempotent (skips already-present titles) and
+  concurrent. **Real measured cost, not an estimate**: ~23s/document average on a small
+  sample (OCR + BGE-M3 embedding dominate) — extrapolated to the full ~107-document
+  corpus, that's a 15-40+ minute range, which could alone approach or exceed the entire
+  G2 budget. `scripts/setup.sh` therefore runs this in the **background**, not awaited,
+  logging to `bulk_ingest.log` — G2 measures the stack being up and accessible, not the
+  full given corpus being pre-loaded (G5 is specifically tested with a document OUTSIDE
+  this corpus). A live grading/demo session still needs to wait for it to finish before
+  the RAG-quality criterion has anything to answer from, though — this is a real risk
+  worth re-measuring on the actual grading machine, not just trusting the small-sample
+  extrapolation above.
 - **Soft delete**: `DELETE /documents/{id}` flips Postgres `status=deleted` and Chroma
   metadata `status=deleted` for all that doc's chunks **synchronously**, before the
   request returns — G5 is tested live, retrieval must exclude it immediately. A later
   background GC job can physically purge; not needed for grading.
 - Every search query filters `status="active"` — this is the single mechanism that makes
   "upload → agent uses it, delete → agent forgets it" true.
+- **Category is a soft ranking boost (`category_hint`), never a hard filter — revised
+  after `docs/dataset-eda.md`.** There is no per-patient knowledge base "assignment" in
+  this design: every call searches the same current, versioned corpus. `status="active"`
+  above is the only hard `where` condition. This isn't a style preference — the
+  challenge's own framing is that patients describe symptoms in "lenguaje cotidiano,
+  ambiguo y regional" with no medical vocabulary to self-classify by, and separately the
+  corpus's own category labels aren't fully trustworthy (the `breast_cancer` folder is
+  verified to be 100% cervical-cancer content, zero mastectomy-relevant material — EDA
+  §5). A hard filter on an untrustworthy label, for a patient who can't verify it either,
+  confidently returns the wrong document while looking correctly scoped — a worse failure
+  mode than returning nothing. `category` (from the patient's profile) still gates the
+  category-*specific* rows in `decision.py`'s red-flag rule table (§2.3) — that's a
+  physiology fact ("no bowel movement" only matters post-colectomy), not a retrieval-
+  scoping question, so it stays a hard condition there.
 
 ### 2.5 Hardware-aware serving (GPU/Metal/CPU)
 
@@ -200,6 +269,74 @@ short-lived LiveKit access token per call (`POST /calls`) so the frontend never 
 LiveKit's admin API directly. Interruption/barge-in uses `livekit-agents`' built-in VAD +
 turn-detector rather than a custom implementation.
 
+### 2.7 Prompt brevity and keeping reasoning out of the spoken output
+
+Phi-3.5-mini is a ~3.8B model. Long, multi-section system prompts with nested conditions
+are exactly what small models lose adherence to over a multi-turn conversation — every
+rule in `app/prompts.py`'s `SYSTEM_PROMPT_ES` has to earn its place against a real failure
+mode (prompt injection, hallucinated dosing, minimizing an alarm symptom, guessing instead
+of asking), not just sound thorough.
+
+Separately: asking a small model to reason briefly before answering measurably helps its
+clinical judgment, but that reasoning must never reach the patient's ears. The prompt asks
+the model to wrap any reasoning in `<think>...</think>` (capped at "una frase corta" to
+bound the cost below), and `voice-agent`'s `PostSurgicalAgent` overrides `Agent.llm_node`
+to pipe the token stream through `app/reasoning.py`'s `strip_reasoning` before it ever
+reaches TTS — a small buffering state machine, unit-tested against same-chunk tags,
+tag-boundary-split-across-chunks, and a malformed-never-closed-tag safety net (verified
+during scaffolding, not just written). Cost: if a reply opens with `<think>`, TTS can't
+start until `</think>` is seen — bounded by the "one short sentence" prompt constraint,
+not by anything in the code. If a reply never opens with `<think>` (the common case),
+there's no added delay: streaming passes through live.
+
+### 2.8 Database migrations
+
+Schema changes are applied by `golang-migrate`, run from `api-gateway`'s own startup
+(`internal/migrate`), against `infra/postgres/migrations/*.up.sql` / `*.down.sql` — not
+by Postgres's own `docker-entrypoint-initdb.d`. That mechanism only ever runs once against
+an empty data volume: fine for the very first boot, silently wrong the moment a second
+migration file exists and someone's running against a volume created before it was added.
+`golang-migrate` tracks applied versions in a `schema_migrations` table it manages, so
+re-running on an already-current schema is a clean no-op — verified directly against a
+real Postgres container (fresh apply creates all 7 tables; second run is a no-op) rather
+than assumed from the library's docs.
+
+This is also why `api-gateway`'s Docker build context is the **repo root**, not
+`services/api-gateway` — the image needs `infra/postgres/migrations/` copied in
+alongside the Go source (see that Dockerfile's top comment).
+
+### 2.9 Auth: deliberately none
+
+`ParticipantArtifacts/README.md`'s "Qué no necesitas construir" list explicitly excludes
+*"autenticación empresarial o gestión de roles"* from required scope. Neither app
+implements any auth. This is a recorded scope decision, not an oversight — call it out the
+same way in the informe rather than let a jury wonder whether it was missed. If this ever
+needs revisiting (e.g. a public demo deployment outside the grading context), the
+cheapest next step is a single shared-secret gate in front of `admin-console`'s
+document-mutating routes only; `call-interface` has no reason to ever gain auth since
+patients don't log in for a phone call.
+
+### 2.10 Sessions
+
+A `calls` row **is** the session unit — one row per voice conversation, with `turns`,
+`escalations`, and `call_summaries` all scoped to it by `call_id`. No separate
+"sessions" table. The one piece of session-continuity work that *is* real: `onDisconnected`
+in `call-interface` only fires after `livekit-client`'s own reconnection attempts are
+exhausted, so there's nothing left to resume at the transport level by then — what matters
+is not minting a brand-new `call_id`/room on a transient drop. `call-interface`'s `App.tsx`
+keeps the existing token/room around and offers a "Reconectar" button (remounting
+`LiveKitRoom` to rejoin the *same* room) instead of silently starting a new, disconnected
+session; only an explicit `CLIENT_INITIATED` disconnect (the patient actually ending the
+call) clears call state back to the start screen. Not yet verified against a real network
+drop, only against a synthetic remount in dev — see that app's README.
+
+Two other continuity mechanisms, same underlying principle ("context at any point in
+time," not just at the transport level): the clinical snapshot on `call_summaries` is
+upserted after *every* turn, not just at call end, so it survives an agent process
+restart mid-call (§3.1); and `db.fetch_latest_snapshot_for_patient` carries that
+snapshot *forward across calls* for the same patient (day-3 knows what day-1 reported),
+which is continuity across sessions, not within one.
+
 ---
 
 ## 3. Data model
@@ -213,22 +350,50 @@ DB)
 documents          (id uuid pk, title, category, status[active|deleted], current_version int, created_at)
 document_versions  (id uuid pk, document_id fk, version int, storage_path, checksum,
                      status[processing|ready|failed|superseded], chunk_count int, processed_at)
-patients           (id uuid pk, external_ref, name, procedure, surgery_date, ...)  -- optional demo seed from dataset
-calls              (id uuid pk, patient_id fk null, started_at, ended_at,
-                     status[active|completed|dropped], stt_mode, llm_model)
-turns              (id uuid pk, call_id fk, role[patient|agent], text, audio_ref null,
+patients           (id uuid pk, external_ref, name, procedure, category, surgery_date,
+                     age, gender, comorbidities jsonb, national_id, address, city,
+                     department, eps, created_at)
+                     -- category is the clean key (decision.py's rules / category_hint key
+                     -- off of); procedure is the human-readable Spanish name. Populated via
+                     -- POST /patients, admin-side, before any call (docs/dataset-eda.md §7).
+calls              (id uuid pk, patient_id fk null, postop_day int null, started_at, ended_at,
+                     status[active|completed|dropped], stt_mode, llm_model, livekit_room)
+turns              (id uuid pk, call_id fk, role[patient|agent|third_party], text, audio_ref null,
                      stt_ms, retrieval_ms, llm_ms, tts_ms, tokens_in, tokens_out,
                      retrieved_chunk_ids text[], created_at)
+                     -- third_party added in migration 0002 -- 151/3991 reference-dataset
+                     -- turns are a family member interjecting, not the patient; a real
+                     -- rojo case's key symptom came from exactly this role (EDA §2).
 escalations        (id uuid pk, call_id fk, level[verde|amarillo|rojo], rationale,
                      triggered_by[model|rule|both], cited_documents jsonb, created_at)
-call_summaries     (id uuid pk, call_id fk unique, procedure, symptoms_reported,
-                     decision, references jsonb, next_steps, created_at)
+call_summaries     (id uuid pk, call_id fk unique, procedure, symptoms_reported, decision,
+                     references jsonb, next_steps,
+                     pain_nrs int, fever_c numeric, mobility enum, wound enum,
+                     appetite enum, sleep enum, updated_at, created_at)
+                     -- the six structured fields mirror the reference dataset's own
+                     -- trajectory taxonomy exactly (EDA §3, §7) and are upserted
+                     -- INCREMENTALLY during the call (voice-agent's
+                     -- db.upsert_clinical_snapshot, COALESCE-merged so a turn that
+                     -- doesn't mention a field never nulls it out) -- this table is a
+                     -- live snapshot, not a write-once end-of-call artifact.
 ```
+
+Migration history: `0001_init` (documents/document_versions/patients-minimal/calls/turns/
+escalations/call_summaries as originally scoped) → `0002_patient_context` (everything
+above marked as added there — third_party role, patient demographic/category/comorbidity
+fields, calls.postop_day, call_summaries' six structured signals). Both verified applying
+and rolling back cleanly against a real Postgres, not just reviewed.
 
 `turns.stt_ms/retrieval_ms/llm_ms/tts_ms` + `tokens_in/out` are what make the README's
 required latency percentiles and consumption metrics computable with a straight SQL
 query instead of hand-waved numbers — wire this in from the first working pipeline, not
 retrofitted at the end.
+
+**Cross-call continuity**: `db.fetch_latest_snapshot_for_patient(patient_id,
+exclude_call_id)` (voice-agent) pulls the most recent prior call's snapshot for the same
+patient, so a day-3 check-in opens already knowing what day-1 reported — the "keep all
+relevant patient context for the agent at any point in time" requirement extends across
+calls, not just within one (see §2.10).
 
 ### 3.2 ChromaDB
 
@@ -245,13 +410,26 @@ workstreams depend on them; change by agreement, not unilaterally.
 ### 4.1 `api-gateway` (Go+Gin), `/api/v1`, OpenAPI-documented
 
 ```
+POST   /patients                  -> {id}                    (category set admin-side, see §2.4/§2.10)
+GET    /patients                  -> [{id, name, category, procedure, ...}]
+GET    /patients/{id}             -> patient detail
 POST   /documents                 multipart upload -> {document_id, version, status:"processing"}
+                 # ALWAYS creates a new, unrelated document_id at version 1.
+PUT    /documents/{id}            multipart upload -> {document_id, version, status}
+                 # Re-indexes an EXISTING document: new version, same document_id, prior
+                 # version's chunks superseded. This is "a PDF is updated", not POST above.
 GET    /documents                 -> [{id, title, category, status, current_version}]
 GET    /documents/{id}/status     -> {status, chunk_count}   (polled by console for "processed and available")
 DELETE /documents/{id}            -> soft delete, synchronous
-POST   /calls                     -> {call_id, livekit_room, livekit_token}
-GET    /calls/{id}                -> call + turns + escalation + summary
-GET    /calls/{id}/summary
+POST   /calls  {patient_id?, postop_day?} -> {call_id, livekit_room, livekit_token}
+                 # patient_id optional (anonymous call still valid). When given: looks up
+                 # the patient, creates the LiveKit room WITH patient context as room
+                 # metadata (internal/livekitadmin, see §2.1), THEN mints the join token --
+                 # this is what closes the "voice-agent doesn't know who it's talking to"
+                 # gap. CreateRoom failure is non-fatal (logged, call proceeds without
+                 # metadata) so a LiveKit admin-API hiccup can't take down G4.
+GET    /calls/{id}                -> call (+ patient_id, postop_day) + turns + escalation + summary
+GET    /calls/{id}/summary        -> live clinical snapshot, not just an end-of-call artifact (§3.1)
 GET    /escalations?level=rojo    -> alert list
 GET    /metrics/summary           -> {p50_ms, p95_ms, tokens_in, tokens_out, rag_queries_per_call, est_cost_per_call}
 POST   /internal/livekit/webhook  -> room/participant lifecycle events
@@ -262,7 +440,8 @@ POST   /internal/livekit/webhook  -> room/participant lifecycle events
 ```
 POST   /ingest   {document_id, version, file, category} -> {chunk_count, status}
 DELETE /documents/{document_id}                          -> soft delete in Chroma, synchronous
-POST   /search   {query, top_k, filters?} -> [{chunk_id, document_id, version, text, page, score, source[dense|bm25|both]}]
+POST   /search   {query, top_k, category_hint?} -> [{chunk_id, document_id, version, text, page, score, source[dense|bm25|both]}]
+                 # category_hint is a soft ranking boost, not a filter -- see §2.4
 GET    /documents/{document_id}/status
 ```
 
@@ -298,7 +477,9 @@ VAD end-of-speech
 │   ├── api-gateway/             # Go + Gin
 │   ├── vector-store/            # Python (uv) + FastAPI + ChromaDB
 │   └── voice-agent/             # Python (uv) + livekit-agents
-├── frontend/                    # React + Vite + TS
+├── frontend/
+│   ├── call-interface/          # React + Vite + TS -- standalone patient app
+│   └── admin-console/           # React + Vite + TS -- standalone admin app
 └── infra/
     ├── livekit/livekit.yaml
     └── postgres/migrations/
@@ -342,13 +523,16 @@ else can start immediately against the frozen contracts in §4.
 | **A — Control plane** | `api-gateway`, Postgres migrations, OpenAPI spec | §3.1 schema (frozen) | `/api/v1` contract for frontend + LiveKit token flow |
 | **B — Knowledge** | `vector-store`, ingestion/chunking, hybrid search, corpus bulk-load | §4.2 contract (frozen) | `/v1/search` + `/v1/ingest` for `voice-agent` and `api-gateway` |
 | **C — Voice pipeline** | `voice-agent`: LiveKit integration, STT/LLM/TTS providers, decision logic, red-flag rules | §4.3 pipeline, B's `/search`, A's Postgres schema | working G4/G5-critical path |
-| **D — Frontend** | Admin console + call interface (React) | A's OpenAPI spec, LiveKit JS SDK token flow | the two required "surfaces" |
+| **D1 — call-interface** | Standalone patient app (React) | A's OpenAPI spec, LiveKit JS SDK token flow | one of the two required "surfaces" |
+| **D2 — admin-console** | Standalone admin app (React) | A's OpenAPI spec | the other required "surface" |
 | **E — Infra** | `docker-compose*.yml`, `setup.sh`, LiveKit config, hardware profiles, model preflight | rough service list (§1, already frozen) | the thing G2's clock measures |
 | **F — Docs/evidence** | `docs/` diagram, decision-flow diagram, README metrics section, informe scaffolding | outputs from all others (late-phase) | entregables 02/03 |
 
 Recommended parallelization: **A, B, E can start immediately in parallel.** C depends on
 B's contract existing (not necessarily implemented) and can build against a mocked
-`/search` response until B is real. D depends on A's contract existing similarly. F
+`/search` response until B is real. D1/D2 depend on A's contract existing similarly, and
+are independent of each other (different apps, no shared code beyond a duplicated API
+client — deliberately not worth a shared package for something this small). F
 starts once there's something to document, but its README metrics section should be
 stubbed early (§0's required fields) so instrumentation isn't bolted on at the end.
 
@@ -364,6 +548,8 @@ stubbed early (§0's required fields) so instrumentation isn't bolted on at the 
 | **Full WebRTC complexity** | Chosen transport is the highest-risk item in scope | LiveKit absorbs the hard parts (§1); don't hand-roll signaling/ICE |
 | **Dual STT adds surface area** | Two providers to keep working and instrumented identically | Shared `STTProvider` interface, same latency/cost logging regardless of mode, test both before submission |
 | **Prompt injection during the live demo** | Explicitly anulls a rubric section if the agent obeys an injected instruction | System prompt with explicit non-negotiable scope boundary, red-flag/escalation logic runs independent of what the conversational track says, add adversarial prompt-injection cases to the pre-submission test script (§9) |
+| **Bulk-loading the full given corpus is genuinely slow** — measured ~23s/document (OCR + BGE-M3 embedding), extrapolating to 15-40+ min for ~107 PDFs | Could alone approach/exceed the G2 budget if run synchronously; separately, the corpus needs to actually be searchable before the live RAG-quality evaluation, which isn't the same clock as G2 | `setup.sh` runs `scripts/bulk_ingest_corpus.py` in the background, not counted in the timed boot (§2.4) — but this shifts the risk to "did it finish before the jury starts asking questions," which needs a real full-corpus timing run on the actual grading-adjacent hardware, not just the small-sample extrapolation this estimate is based on |
+| **Lazy-loaded assets pay their load cost on whichever request/call happens to be first** — found for real twice, not theoretical: vector-store's first ingest request ate BGE-M3's ~2.2GB load and blew api-gateway's client timeout even though it eventually succeeded (fixed: background warmup at startup, `/v1/healthz` gates on it); Docker-mode `ollama` came up with **no model pulled at all** (`setup.sh` only ever ran `ollama pull` in native mode — a total-failure gap, not just slowness); `LocalWhisperSTT` was reloading faster-whisper's model from scratch on every single call (instance-attribute cache, but a fresh instance was constructed per call) | Any of these could turn "first patient's call" (or the graded G4 call) into the one that times out or fails, purely because of load-order luck | Systematic pass over every heavy asset in voice-agent, verified live end to end: Silero VAD + Kokoro TTS + Ollama's first-inference cost now warm once per worker process via `WorkerOptions.prewarm_fnc` (confirmed from `livekit-agents` source that this runs before any job is dispatched to that process); faster-whisper moved to a module-level cache so it's no longer per-call; the turn-detector plugin's ONNX weights are prefetched via its own `download-files` mechanism (baked into the Docker image, run in parallel by `setup.sh` in native mode) since — verified live — the plugin object itself can't be constructed outside an active job context; Docker-mode `ollama` model pull fixed to actually happen, over its HTTP API. Full detail and the live numbers behind each fix: `services/voice-agent/README.md`'s "Warmup" section |
 
 ---
 
@@ -382,6 +568,9 @@ environment that's been running for two days:
       ambiguous case (ambiguous should trigger a clarifying question, not a guess)
 - [ ] Prompt injection: attempt to get the agent to ignore its scope mid-call
 - [ ] Adversarial audio: background noise, regional slang, a hostile/scared-patient tone
+- [ ] Confirm no `<think>...</think>` reasoning is ever audible in the agent's spoken reply
+- [ ] Kill the network mid-call on `call-interface` and confirm "Reconectar" resumes the
+      same `call_id` (same turns/escalation history), not a fresh empty session
 - [ ] Pull `/api/v1/metrics/summary`, cross-check the numbers against what's written in
       the README — inconsistency here is explicitly penalized
 - [ ] Diagram in `docs/` matches what's actually in `services/` — the rubric says the
