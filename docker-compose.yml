@@ -1,0 +1,171 @@
+# Base compose file. See specs/implementation-plan.md §1/§5 for the service map and
+# §2.5 for why `ollama` and `voice-agent` are profile-gated separately from everything
+# else (macOS/Docker has no Metal passthrough, so scripts/setup.sh runs them natively on
+# the host in that case instead).
+#
+# Every service in this project carries the "tqida" profile, so it's always the base
+# switch for "launch everything that belongs to this project" -- useful mainly to
+# distinguish this stack's services by profile if this host ever runs other Compose
+# projects alongside it. `ollama`/`voice-agent` carry a SECOND profile each
+# (`docker-models`/`docker-agent`) on top of "tqida", not instead of it -- Compose starts
+# a service if ANY of its profiles is active, so activating "tqida" alone (without the
+# hardware profiles) deliberately excludes them, matching native-agent mode. This also
+# means `--profile tqida` alone skips *building* their images too, not just running them
+# -- real savings against the 15-minute cold-start budget when they're not needed.
+#
+# Usage:
+#   docker compose --profile tqida --profile docker-models --profile docker-agent up -d
+#     # Linux / CPU-or-CUDA default: everything in Docker
+#   docker compose --profile tqida up -d
+#     # macOS native-agent mode: everything except ollama+voice-agent, which run
+#     # natively on the host instead (see scripts/setup.sh --native-agent)
+# scripts/setup.sh picks the right invocation for you; see that script before running
+# docker compose by hand.
+
+name: techsphere2026
+
+x-env-file: &env_file
+  env_file:
+    - .env
+
+services:
+  # Schema is applied by api-gateway at startup via golang-migrate (see
+  # services/api-gateway/internal/migrate/migrate.go), not Postgres's own
+  # docker-entrypoint-initdb.d -- that mechanism only runs once against an empty volume
+  # and silently stops applying anything once a second migration file exists.
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["tqida"]
+    <<: *env_file
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-techsphere}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-techsphere}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-techsphere} -d ${POSTGRES_DB:-techsphere}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  livekit:
+    image: livekit/livekit-server:latest
+    command: ["--config", "/etc/livekit.yaml"]
+    profiles: ["tqida"]
+    <<: *env_file
+    environment:
+      # Single source of truth for the API key/secret is .env, not livekit.yaml, so
+      # rotating credentials never means editing two files. See infra/livekit/livekit.yaml.
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-changeme_min_32_chars_______________}"
+    ports:
+      - "7880:7880"   # HTTP/WebSocket signaling
+      - "7881:7881"   # RTC over TCP (fallback)
+      - "50000-50100:50000-50100/udp"  # RTC media (narrow this range in production)
+    volumes:
+      - ./infra/livekit/livekit.yaml:/etc/livekit.yaml:ro
+
+  ollama:
+    image: ollama/ollama:latest
+    # NOT tagged "tqida" -- see top-of-file comment. Only starts (and only gets built/
+    # pulled) when docker-models is explicitly activated too.
+    profiles: ["docker-models"]  # skipped on macOS native-agent mode; see §2.5
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # TODO(workstream E): add docker-compose.gpu.yml override for NVIDIA passthrough on Linux.
+
+  vector-store:
+    build:
+      context: ./services/vector-store
+    profiles: ["tqida"]
+    <<: *env_file
+    environment:
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      CHROMA_PERSIST_DIR: /data/chroma
+    ports:
+      - "8001:8001"
+    volumes:
+      - chroma_data:/data/chroma
+      - hf_cache:/root/.cache/huggingface
+
+  api-gateway:
+    build:
+      # Context is the repo root, not services/api-gateway -- see that Dockerfile's
+      # top comment for why (it needs infra/postgres/migrations/ in its build context).
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    profiles: ["tqida"]
+    <<: *env_file
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://techsphere:changeme@postgres:5432/techsphere?sslmode=disable}
+      VECTOR_STORE_URL: http://vector-store:8001
+      LIVEKIT_HOST_URL: http://livekit:7880
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vector-store:
+        condition: service_started
+      livekit:
+        condition: service_started
+
+  voice-agent:
+    build:
+      context: ./services/voice-agent
+    # NOT tagged "tqida" -- see top-of-file comment. Only starts (and only gets built)
+    # when docker-agent is explicitly activated too.
+    profiles: ["docker-agent"]  # skipped on macOS native-agent mode; see §2.5
+    <<: *env_file
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://techsphere:changeme@postgres:5432/techsphere?sslmode=disable}
+      VECTOR_STORE_URL: http://vector-store:8001
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
+      LIVEKIT_URL: ${LIVEKIT_URL:-ws://livekit:7880}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vector-store:
+        condition: service_started
+      livekit:
+        condition: service_started
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+
+  # Two separate apps, not one SPA with two routes -- different audiences (patient vs
+  # admin) and different auth postures going forward. See specs/implementation-plan.md §1.
+  call-interface:
+    build:
+      context: ./frontend/call-interface
+      args:
+        # Vite bakes these in at build time -- see that Dockerfile's comment.
+        VITE_API_GATEWAY_URL: ${VITE_API_GATEWAY_URL:-http://localhost:8080}
+        VITE_LIVEKIT_URL: ${VITE_LIVEKIT_URL:-ws://localhost:7880}
+    profiles: ["tqida"]
+    <<: *env_file
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api-gateway
+
+  admin-console:
+    build:
+      context: ./frontend/admin-console
+      args:
+        VITE_API_GATEWAY_URL: ${VITE_API_GATEWAY_URL:-http://localhost:8080}
+    profiles: ["tqida"]
+    <<: *env_file
+    ports:
+      - "5174:5174"
+    depends_on:
+      - api-gateway
+
+volumes:
+  pgdata:
+  ollama_data:
+  chroma_data:
+  hf_cache:
