@@ -1,0 +1,123 @@
+/* UX considerations from scaffolding.md: big and clear buttons and text, clean
+   interfacing. This app is admin-facing, but the same visual language as call-interface
+   is kept for consistency (the rubric doesn't score aesthetics either way). */
+
+.app-main {
+  max-width: 860px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+
+h1 {
+  font-size: 34px;
+  margin: 0 0 8px;
+}
+
+.subtitle {
+  color: var(--text-muted);
+  margin: 0 0 32px;
+  font-size: 19px;
+}
+
+.big-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  font-size: 22px;
+  font-weight: 700;
+  padding: 20px 36px;
+  border-radius: 16px;
+  border: none;
+  cursor: pointer;
+  background: var(--accent);
+  color: white;
+  min-width: 220px;
+  transition: background 0.15s;
+}
+
+.big-button:hover {
+  background: var(--accent-hover);
+}
+
+.big-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.big-button.danger {
+  background: var(--danger);
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 24px;
+  margin-bottom: 24px;
+}
+
+.status-pill {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.status-pill.ready,
+.status-pill.verde {
+  background: color-mix(in srgb, var(--verde) 18%, transparent);
+  color: var(--verde);
+}
+
+.status-pill.processing,
+.status-pill.amarillo {
+  background: color-mix(in srgb, var(--amarillo) 18%, transparent);
+  color: var(--amarillo);
+}
+
+.status-pill.failed,
+.status-pill.rojo {
+  background: color-mix(in srgb, var(--rojo) 18%, transparent);
+  color: var(--rojo);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 17px;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 12px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+form.upload-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+form.upload-form input,
+form.upload-form select {
+  font-size: 18px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.error-banner {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  padding: 14px 18px;
+  border-radius: 12px;
+  margin-bottom: 20px;
+  font-size: 16px;
+}
