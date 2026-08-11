@@ -57,9 +57,44 @@ like. What's still open:
       document was mid-OCR. Fixed by moving the CPU-bound path into a plain sync helper
       called via `asyncio.to_thread`, verified live: the container's Docker healthcheck
       went from `unhealthy` (repeated timeouts) to `healthy` under load after the fix.
+- [x] ~~Two real thread-safety bugs found running a real bulk-load under concurrency~~ --
+      (1) running BGE-M3 `encode()` calls concurrently doesn't parallelize, it makes
+      EVERY call ~13x slower (measured: 4 concurrent calls took 5.05s each vs 1.49s
+      total for 4 sequential -- almost certainly CPU/GPU oversubscription, torch's own
+      intra-op threading already saturates the device for one call). (2) ChromaDB's
+      client genuinely isn't thread-safe: concurrent access produced real corrupted
+      requests (`AttributeError: 'RustBindingsAPI' object has no attribute 'bindings'`,
+      `ValueError: Could not connect to tenant default_tenant`), not just contention.
+      Both fixed with a `threading.Lock` around just the critical section
+      (`_encode_lock` in `app/embeddings.py`, `_chroma_lock` in `app/store.py`) -- OCR/
+      PDF extraction (genuinely parallel, tesseract subprocesses) still overlaps across
+      concurrent requests, only the embed+store tail is serialized.
+- [x] ~~BGE-M3 was CPU-only even on macOS~~ -- not a code bug, an architectural one: this
+      service ran in Docker in BOTH modes, and Docker Desktop has no Metal passthrough at
+      all, full stop. `FlagEmbedding` already auto-detects MPS correctly when actually
+      running on the host (checked its source: falls back through npu/musa/mps/cpu, not
+      a CUDA-only check like an unrelated bug found the same way in Kokoro's device
+      selection, voice-agent). Moved to native mode alongside ollama/voice-agent (see
+      docker-compose.yml, scripts/setup.sh) -- zero code changes needed, just don't run
+      it in Docker. Verified live: `get_embedder()`'s `target_devices` reports
+      `['mps:0']`, and a real bulk-ingest run went from ~90s/document (Docker/CPU) to
+      ~13.5s/document average (native/Metal, full 107-doc corpus, 1449s total, 0
+      failures) -- see root README.
+- [x] ~~Chroma ran embedded (`PersistentClient`, a local file) instead of as its own
+      service~~ -- a real, fair critique of the fix above: moving vector-store natively
+      also silently took Chroma out of Docker with it (embedded libraries follow the
+      process that opened them), even though Chroma does no GPU/Metal work at all (it's
+      disk I/O + a vector index; we don't use its embedding-function hook). Switched to
+      `chromadb.HttpClient` against the official `chromadb/chroma` server image
+      (docker-compose.yml, pinned to the same version as the `chromadb` client to avoid
+      protocol drift) -- Chroma now runs in Docker in BOTH modes, same as
+      postgres/livekit, visible in `docker compose ps` again. Verified live: full
+      ingest → search round trip against the new architecture, real chunks returned
+      with correct citations.
 - [ ] BM25 index caching (`app/hybrid_search.py` rebuilds it from Chroma on every search
       call -- fine at this corpus size, revisit if latency data says otherwise)
-- [ ] GPU/CUDA torch wheel for the `docker-compose.gpu.yml` profile (Dockerfile TODO)
+- [ ] GPU/CUDA torch wheel for the `docker-compose.gpu.yml` profile (Dockerfile TODO) --
+      lower priority now that native-mode Metal covers the macOS dev/grading path
 
 ## A ChromaDB gotcha worth knowing before touching `where` clauses
 
@@ -72,14 +107,29 @@ route every new multi-condition filter through it rather than hand-building a di
 
 Not this service's job directly -- see `../../scripts/bulk_ingest_corpus.py`, which walks
 `dataset/textos/*/*.pdf` and POSTs each one through **api-gateway's** `/documents`
-endpoint (identity ownership stays with api-gateway, plan §2.4). Real measured cost:
-~23s/document (OCR + embedding dominate) -- see that script's docstring and plan §8 for
-why `scripts/setup.sh` runs it in the background rather than blocking on it.
+endpoint (identity ownership stays with api-gateway, plan §2.4). `scripts/setup.sh` now
+runs this BLOCKING (a system that can't answer from the knowledge base isn't "corriendo y
+accesible" yet) -- see root README for the real measured full-corpus time on native/Metal
+vs. the earlier Docker/CPU numbers.
+
+To skip re-running this on every fresh boot, `../../scripts/export_kb_seed.sh` snapshots
+an already-ingested corpus (Postgres rows + the `chroma_data` Docker volume) into one
+archive; `import_kb_seed.sh` restores it. See both scripts' docstrings -- this doesn't
+weaken G5 (tested with a document outside the seed, so the live ingestion pipeline still
+has to work for real).
 
 ## Run locally (outside Docker)
 
+This is the DEFAULT on macOS now, not just an ad-hoc dev option -- `scripts/setup.sh`
+runs this service exactly this way in native-agent mode, to get Metal for BGE-M3 (Docker
+Desktop has no Metal passthrough; see docker-compose.yml's top comment). Needs
+`tesseract`/`tesseract-lang` on the host (`brew install tesseract tesseract-lang`) for
+the OCR fallback -- already baked into the Dockerfile for Docker mode. Chroma itself
+still runs in Docker either way (`docker compose up -d chroma`) -- it does no GPU work,
+so there's no reason for it to run natively too; this process reaches it over HTTP.
+
 ```sh
-export CHROMA_PERSIST_DIR=/tmp/chroma-dev   # /data/chroma is the container-only default
+export CHROMA_HOST=localhost CHROMA_PORT=8000   # Docker Desktop publishes the chroma container's port here
 uv run uvicorn app.main:app --port 8001 --reload
 ```
 
@@ -87,4 +137,6 @@ Note: startup now pre-warms BGE-M3 (~2GB, downloaded from Hugging Face on first 
 background task -- `/v1/healthz` reports `503 "loading"` until it's ready, `200` after.
 Don't be alarmed if that takes a while on a cold cache; it's the same cost the 15-minute
 cold-start budget (plan §8) has to account for, just no longer hidden inside whichever
-request happens to arrive first.
+request happens to arrive first. On macOS this now loads onto `mps:0` automatically
+(verified via `get_embedder().target_devices`) -- if you ever see `cpu` there instead on
+a Mac, something's wrong (missing MPS build of torch, or accidentally running in Docker).

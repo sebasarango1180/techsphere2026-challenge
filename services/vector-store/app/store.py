@@ -18,19 +18,22 @@ from app.embeddings import embed_texts
 logger = logging.getLogger(__name__)
 
 # Found live, the hard way, running a real bulk-load under concurrency: ChromaDB's
-# PersistentClient (Rust-backed) is not safe to call from multiple threads at once.
-# `/v1/ingest`'s asyncio.to_thread now lets several requests reach this module
-# concurrently, and that produced real, silent-looking failures --
+# PersistentClient (Rust-backed, embedded in-process) was not safe to call from multiple
+# threads at once -- `/v1/ingest`'s asyncio.to_thread lets several requests reach this
+# module concurrently, and that produced real, silent-looking failures --
 # `AttributeError: 'RustBindingsAPI' object has no attribute 'bindings'` deep inside
 # chromadb's own client code, and `ValueError: Could not connect to tenant
 # default_tenant` -- both symptoms of the same underlying client object being torn by
 # concurrent access, not a data problem with any particular document. `get_collection`'s
 # `lru_cache` only makes the *cached object* thread-safe to store/retrieve; it does
-# nothing to make concurrent `.get()`/`.add()`/`.update()` calls on that object safe,
-# and neither does the client library itself. This lock serializes every Chroma
-# operation the same way embeddings.py's `_encode_lock` serializes BGE-M3 -- OCR/PDF
-# extraction (the genuinely parallel, CPU-bound part) still overlaps across threads;
-# only the Chroma read/write tail of each request is forced one-at-a-time.
+# nothing to make concurrent `.get()`/`.add()`/`.update()` calls on that object safe.
+# Since then, Chroma moved from an embedded library to its own server (HttpClient, see
+# get_collection below and docker-compose.yml's top comment) -- this lock is kept as the
+# safe default since HttpClient's own thread-safety under this exact concurrency
+# pattern hasn't been separately re-verified, not because the original Rust-binding
+# failure is known to still apply over HTTP. OCR/PDF extraction (the genuinely parallel,
+# CPU-bound part) still overlaps across threads either way; only the Chroma read/write
+# tail of each request is forced one-at-a-time.
 _chroma_lock = threading.Lock()
 
 
@@ -47,7 +50,7 @@ def combine_where(conditions: dict) -> dict:
 
 @lru_cache(maxsize=1)
 def get_collection():
-    client = chromadb.PersistentClient(path=settings.chroma_persist_dir)
+    client = chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
     return client.get_or_create_collection(name=settings.chroma_collection)
 
 

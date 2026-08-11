@@ -19,6 +19,13 @@ class CallContext:
     category: str | None = None
     procedure: str | None = None
     postop_day: int | None = None
+    # age/comorbidities: populated either from a registered patient's own record, or --
+    # for an anonymous call -- directly from what the caller typed into call-interface's
+    # pre-call form (services/api-gateway/internal/httpapi/calls.go's CreateCall). Purely
+    # contextual for the agent (app/prompts.py's build_instructions); nothing in the
+    # pipeline currently branches on age itself.
+    age: int | None = None
+    comorbidities: list[str] | None = None
 
 
 def from_room(room_name: str, metadata_json: str | None) -> CallContext:
@@ -39,4 +46,6 @@ def from_room(room_name: str, metadata_json: str | None) -> CallContext:
         category=meta.get("category") or None,
         procedure=meta.get("procedure") or None,
         postop_day=meta.get("postop_day"),
+        age=meta.get("age"),
+        comorbidities=meta.get("comorbidities") or None,
     )

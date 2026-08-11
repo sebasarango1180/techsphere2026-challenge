@@ -66,12 +66,17 @@ type IngestAccepted struct {
 	Status     string `json:"status"`
 }
 
-// CallCreateRequest: both fields optional -- an anonymous call (no patient_id) is still
-// a valid call, it just won't have category-gated rules or room metadata to work with
-// (voice-agent falls back to category=None, same as before this existed).
+// CallCreateRequest: all fields optional -- an anonymous call (no patient_id) is still a
+// valid call. PatientName/Age/Comorbidities are the ad-hoc equivalent for an anonymous
+// caller who wants the agent to have SOME context without being a registered patient
+// (call-interface's pre-call form) -- only used when PatientID is empty; a registered
+// patient's own DB row remains the source of truth otherwise (see CreateCall).
 type CallCreateRequest struct {
-	PatientID string `json:"patient_id"`
-	PostopDay *int   `json:"postop_day"`
+	PatientID     string   `json:"patient_id"`
+	PostopDay     *int     `json:"postop_day"`
+	PatientName   string   `json:"patient_name"`
+	Age           *int     `json:"age"`
+	Comorbidities []string `json:"comorbidities"`
 }
 
 type CallCreated struct {
@@ -104,9 +109,11 @@ type Escalation struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-// CallSummary is a LIVE clinical snapshot, not a write-once end-of-call artifact -- see
-// infra/postgres/migrations/0002_patient_context.up.sql's comment on the table. The six
-// structured fields mirror the reference dataset's own trajectory taxonomy exactly
+// CallSummary combines the LIVE clinical snapshot (see
+// infra/postgres/migrations/0002_patient_context.up.sql's comment on the table) with the
+// end-of-call classification added by 0003_final_triage.up.sql and the KB-grounded
+// pathology validation added by 0004_pathology_validation.up.sql. The six structured
+// signal fields mirror the reference dataset's own trajectory taxonomy exactly
 // (docs/dataset-eda.md §3/§7) so a call's outcome is directly comparable to it.
 type CallSummary struct {
 	Procedure        string     `json:"procedure"`
@@ -114,13 +121,23 @@ type CallSummary struct {
 	Decision         string     `json:"decision"`
 	References       []any      `json:"references"`
 	NextSteps        string     `json:"next_steps"`
-	PainNRS          *int       `json:"pain_nrs,omitempty"`          // 0-10
+	PainNRS          *int       `json:"pain_nrs,omitempty"` // 0-10
 	FeverC           *float64   `json:"fever_c,omitempty"`
-	Mobility         *string    `json:"mobility,omitempty"`          // normal | limitada_esperada | incapacitante_nueva
-	Wound            *string    `json:"wound,omitempty"`             // normal | eritema_leve | secrecion_purulenta
-	Appetite         *string    `json:"appetite,omitempty"`          // normal | levemente_disminuido | muy_disminuido
-	Sleep            *string    `json:"sleep,omitempty"`             // normal | levemente_alterado | muy_alterado
+	Mobility         *string    `json:"mobility,omitempty"` // normal | limitada_esperada | incapacitante_nueva
+	Wound            *string    `json:"wound,omitempty"`    // normal | eritema_leve | secrecion_purulenta
+	Appetite         *string    `json:"appetite,omitempty"` // normal | levemente_disminuido | muy_disminuido
+	Sleep            *string    `json:"sleep,omitempty"`    // normal | levemente_alterado | muy_alterado
 	UpdatedAt        *time.Time `json:"updated_at,omitempty"`
+
+	// FinalTriage is the authoritative end-of-call classification (max of the model's
+	// whole-transcript read and the deterministic rule layer's worst finding) -- distinct
+	// from Escalation, which is the most recent REAL-TIME rule-layer hit during the call.
+	FinalTriage         *string  `json:"final_triage,omitempty"` // verde | amarillo | rojo
+	TriageRationale     *string  `json:"triage_rationale,omitempty"`
+	TriageConfidence    *float64 `json:"triage_confidence,omitempty"`
+	MissingInfo         []any    `json:"missing_info"`
+	PathologyAssessment *string  `json:"pathology_assessment,omitempty"`
+	PathologyEvidence   []any    `json:"pathology_evidence"`
 }
 
 type CallDetail struct {
@@ -133,13 +150,42 @@ type CallDetail struct {
 	Summary    *CallSummary `json:"summary,omitempty"`
 }
 
+// CallListItem is one row of GET /api/v1/calls -- calls joined with its patient identity
+// and current call_summaries snapshot, so the admin console's "Calls" tab can render the
+// whole list without an N+1 GetCallSummary round-trip per row (see
+// infra/postgres/migrations/0003_final_triage.up.sql's comment on the intended UI).
+type CallListItem struct {
+	ID          string     `json:"id"`
+	PatientID   *string    `json:"patient_id,omitempty"`
+	PatientName *string    `json:"patient_name,omitempty"`
+	Category    *string    `json:"category,omitempty"`
+	PostopDay   *int       `json:"postop_day,omitempty"`
+	Status      string     `json:"status"` // active | completed | dropped
+	StartedAt   time.Time  `json:"started_at"`
+	EndedAt     *time.Time `json:"ended_at,omitempty"`
+
+	PainNRS  *int     `json:"pain_nrs,omitempty"`
+	FeverC   *float64 `json:"fever_c,omitempty"`
+	Mobility *string  `json:"mobility,omitempty"`
+	Wound    *string  `json:"wound,omitempty"`
+	Appetite *string  `json:"appetite,omitempty"`
+	Sleep    *string  `json:"sleep,omitempty"`
+
+	FinalTriage         *string  `json:"final_triage,omitempty"`
+	TriageRationale     *string  `json:"triage_rationale,omitempty"`
+	TriageConfidence    *float64 `json:"triage_confidence,omitempty"`
+	MissingInfo         []any    `json:"missing_info"`
+	PathologyAssessment *string  `json:"pathology_assessment,omitempty"`
+	PathologyEvidence   []any    `json:"pathology_evidence"`
+}
+
 // MetricsSummary is what the README's required metrics table (specs/implementation-plan.md
 // §0) gets computed from -- see internal/httpapi/metrics.go for the SQL that fills this in.
 type MetricsSummary struct {
-	P50Ms              float64 `json:"p50_ms"`
-	P95Ms              float64 `json:"p95_ms"`
-	TokensIn           int64   `json:"tokens_in"`
-	TokensOut          int64   `json:"tokens_out"`
-	RAGQueriesPerCall  float64 `json:"rag_queries_per_call"`
-	EstCostPerCall     float64 `json:"est_cost_per_call"`
+	P50Ms             float64 `json:"p50_ms"`
+	P95Ms             float64 `json:"p95_ms"`
+	TokensIn          int64   `json:"tokens_in"`
+	TokensOut         int64   `json:"tokens_out"`
+	RAGQueriesPerCall float64 `json:"rag_queries_per_call"`
+	EstCostPerCall    float64 `json:"est_cost_per_call"`
 }

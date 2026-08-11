@@ -123,6 +123,49 @@ async def finalize_call_summary(
     )
 
 
+async def finalize_triage(
+    *,
+    call_id: str,
+    level: str,
+    rationale: str,
+    confidence: float | None,
+    missing_info: list[str] | None,
+    pathology_assessment: str | None = None,
+    pathology_evidence: list[dict] | None = None,
+) -> None:
+    """The authoritative end-of-call classification -- see
+    infra/postgres/migrations/0003_final_triage.up.sql's comment for why this is
+    computed once at call end (over the full transcript) rather than incrementally per
+    turn like upsert_clinical_snapshot's six signals. Separate from the real-time
+    escalations table: a mid-call rule-layer hit still writes its own escalations row
+    immediately (app/main.py's on_user_turn_completed, unaffected by this), this is the
+    final, whole-call assessment recorded once the six-topic script is complete.
+
+    pathology_assessment/pathology_evidence (infra/postgres/migrations/
+    0004_pathology_validation.up.sql): the KB-grounded read on whether the reported
+    symptoms match a normal recovery or a possible complication, with the specific
+    chunks backing it -- same cited_documents shape as insert_escalation.
+    """
+    pool = await get_pool()
+    await pool.execute(
+        """
+        INSERT INTO call_summaries (call_id, final_triage, triage_rationale, triage_confidence,
+                                     missing_info, pathology_assessment, pathology_evidence, updated_at)
+        VALUES ($1, $2::triage_level, $3, $4, $5::jsonb, $6, $7::jsonb, now())
+        ON CONFLICT (call_id) DO UPDATE SET
+            final_triage          = COALESCE(EXCLUDED.final_triage, call_summaries.final_triage),
+            triage_rationale      = COALESCE(EXCLUDED.triage_rationale, call_summaries.triage_rationale),
+            triage_confidence     = COALESCE(EXCLUDED.triage_confidence, call_summaries.triage_confidence),
+            missing_info          = COALESCE(EXCLUDED.missing_info, call_summaries.missing_info),
+            pathology_assessment  = COALESCE(EXCLUDED.pathology_assessment, call_summaries.pathology_assessment),
+            pathology_evidence    = COALESCE(EXCLUDED.pathology_evidence, call_summaries.pathology_evidence),
+            updated_at            = now()
+        """,
+        call_id, level, rationale, confidence, json.dumps(missing_info or []),
+        pathology_assessment, json.dumps(pathology_evidence or []),
+    )
+
+
 async def fetch_latest_snapshot_for_patient(patient_id: str, exclude_call_id: str) -> dict | None:
     """The most recent PRIOR call's clinical snapshot for this patient -- cross-call
     continuity (plan §2.10): a day-3 check-in should know what day-1 reported. Returns

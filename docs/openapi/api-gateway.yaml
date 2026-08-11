@@ -139,6 +139,23 @@ paths:
               schema: { $ref: "#/components/schemas/Patient" }
 
   /calls:
+    get:
+      summary: >-
+        List calls -- one row per call, joined with patient identity and the current
+        call_summaries snapshot (six signals, final triage, pathology validation). Backs
+        the admin console's "Calls" tab.
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [active, completed, dropped] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CallListItem" }
     post:
       summary: >-
         Start a call session; looks up the patient (if patient_id given), creates the
@@ -275,10 +292,17 @@ components:
 
     CallCreateRequest:
       type: object
-      description: Both fields optional -- omit patient_id for an anonymous call.
+      description: >-
+        All fields optional -- omit patient_id for an anonymous call. patient_name/age/
+        comorbidities are the ad-hoc equivalent for an anonymous caller (call-interface's
+        pre-call form) and are only used when patient_id is empty -- a registered
+        patient's own record is the source of truth otherwise.
       properties:
         patient_id: { type: string, format: uuid }
         postop_day: { type: integer }
+        patient_name: { type: string }
+        age: { type: integer }
+        comorbidities: { type: array, items: { type: string } }
 
     DocumentSummary:
       type: object
@@ -342,10 +366,11 @@ components:
     CallSummary:
       type: object
       description: >-
-        A LIVE clinical snapshot, upserted incrementally during the call (not written
-        once at the end) -- see infra/postgres/migrations/0002_patient_context.up.sql.
-        The six structured fields mirror the reference dataset's own trajectory
-        taxonomy exactly (docs/dataset-eda.md §3, §7).
+        The LIVE clinical snapshot (upserted incrementally during the call, see
+        infra/postgres/migrations/0002_patient_context.up.sql) combined with the
+        end-of-call classification (0003_final_triage.up.sql) and KB-grounded pathology
+        validation (0004_pathology_validation.up.sql). The six structured fields mirror
+        the reference dataset's own trajectory taxonomy exactly (docs/dataset-eda.md §3, §7).
       properties:
         procedure: { type: string, nullable: true }
         symptoms_reported: { type: string, nullable: true }
@@ -359,6 +384,37 @@ components:
         appetite: { type: string, nullable: true, enum: [normal, levemente_disminuido, muy_disminuido] }
         sleep: { type: string, nullable: true, enum: [normal, levemente_alterado, muy_alterado] }
         updated_at: { type: string, format: date-time, nullable: true }
+        final_triage: { type: string, nullable: true, enum: [verde, amarillo, rojo] }
+        triage_rationale: { type: string, nullable: true }
+        triage_confidence: { type: number, nullable: true, minimum: 0, maximum: 1 }
+        missing_info: { type: array, items: { type: string } }
+        pathology_assessment: { type: string, nullable: true }
+        pathology_evidence: { type: array, items: { type: object } }
+
+    CallListItem:
+      type: object
+      description: One row of GET /calls -- calls joined with patient identity and call_summaries.
+      properties:
+        id: { type: string, format: uuid }
+        patient_id: { type: string, format: uuid, nullable: true }
+        patient_name: { type: string, nullable: true }
+        category: { type: string, nullable: true }
+        postop_day: { type: integer, nullable: true }
+        status: { type: string, enum: [active, completed, dropped] }
+        started_at: { type: string, format: date-time }
+        ended_at: { type: string, format: date-time, nullable: true }
+        pain_nrs: { type: integer, nullable: true, minimum: 0, maximum: 10 }
+        fever_c: { type: number, nullable: true }
+        mobility: { type: string, nullable: true, enum: [normal, limitada_esperada, incapacitante_nueva] }
+        wound: { type: string, nullable: true, enum: [normal, eritema_leve, secrecion_purulenta] }
+        appetite: { type: string, nullable: true, enum: [normal, levemente_disminuido, muy_disminuido] }
+        sleep: { type: string, nullable: true, enum: [normal, levemente_alterado, muy_alterado] }
+        final_triage: { type: string, nullable: true, enum: [verde, amarillo, rojo] }
+        triage_rationale: { type: string, nullable: true }
+        triage_confidence: { type: number, nullable: true, minimum: 0, maximum: 1 }
+        missing_info: { type: array, items: { type: string } }
+        pathology_assessment: { type: string, nullable: true }
+        pathology_evidence: { type: array, items: { type: object } }
 
     Escalation:
       type: object

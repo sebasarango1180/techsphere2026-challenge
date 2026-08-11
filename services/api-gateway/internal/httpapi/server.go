@@ -52,6 +52,7 @@ func NewRouter(s *Server) *gin.Engine {
 		v1.GET("/patients/:id", s.GetPatient)
 
 		v1.POST("/calls", s.CreateCall)
+		v1.GET("/calls", s.ListCalls)
 		v1.GET("/calls/:id", s.GetCall)
 		v1.GET("/calls/:id/summary", s.GetCallSummary)
 

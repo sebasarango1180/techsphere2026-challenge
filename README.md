@@ -23,8 +23,18 @@ cd techsphere2026-challenge
 
 Detecta el sistema operativo y el hardware disponible (ver
 [`specs/implementation-plan.md`](specs/implementation-plan.md) §2.5 para el porque del
-modo nativo en macOS) y levanta todo: base de datos, LiveKit, vector-store, modelo,
-api-gateway y frontend.
+modo nativo en macOS) y levanta todo: base de datos, LiveKit, Chroma, vector-store,
+modelo, api-gateway y frontend. En macOS, `ollama`, `voice-agent`, y **`vector-store`**
+corren nativos en el host (no en Docker) para tener acceso a Metal -- Docker Desktop no
+puede pasar a traves de Metal bajo ninguna circunstancia, y BGE-M3 (el modelo de
+embeddings) resulto ser CPU-only incluso en modo nativo hasta que se movio vector-store
+fuera de Docker tambien. **Chroma en si NO se movio** -- corre como su propio contenedor
+(imagen oficial `chromadb/chroma`) en ambos modos, igual que postgres/livekit, porque no
+hace ningun trabajo de GPU/Metal; vector-store (nativo o no, segun el modo) le habla por
+HTTP. Ver `services/vector-store/README.md` para el detalle completo, incluyendo un error
+real de diseño encontrado en el camino: mover TODO el proceso de vector-store nativo
+tambien saco a Chroma de Docker (una libreria embebida sigue al proceso que la abre),
+aunque Chroma no lo necesitaba.
 
 - Interfaz de llamada (paciente): http://localhost:5173
 - Consola de administracion: http://localhost:5174
@@ -42,10 +52,24 @@ la entrega final._
 `bulk_ingest.log`) de forma **bloqueante**, como parte del mismo levantamiento cronometrado
 -- un sistema que no puede responder con la base de conocimiento no esta realmente
 "corriendo y accesible" todavia. Ver `specs/implementation-plan.md` §8 para el
-razonamiento y las cifras reales medidas (incluye dos bugs reales encontrados y
-corregidos que hacian esto mucho mas lento de lo necesario: `/v1/ingest` bloqueaba el
-event loop de vector-store, y ejecutar embeddings BGE-M3 en paralelo los hacia ~13x mas
-lentos por contencion de CPU, no mas rapidos).
+razonamiento completo y `services/vector-store/README.md` para las cifras reales medidas
+(tres bugs reales encontrados y corregidos que hacian esto mucho mas lento -- o
+directamente incorrecto -- de lo necesario: `/v1/ingest` bloqueaba el event loop de
+vector-store; tanto los embeddings BGE-M3 como el cliente de ChromaDB resultaron no ser
+thread-safe bajo concurrencia, no solo lentos sino con corrupcion real de requests; y
+BGE-M3 corria en CPU incluso en modo nativo porque vector-store seguia en Docker, sin
+acceso a Metal). **Medido en vivo, corpus completo de 107 PDFs:** ~90s/documento en
+Docker/CPU (la arquitectura anterior) vs. **1449s totales (~24.2 min, ~13.5s/documento)
+en nativo/Metal contra la arquitectura final** (Chroma como servidor propio, ver mas
+abajo) -- 0 fallos.
+
+Para no pagar ese costo en cada arranque, `scripts/export_kb_seed.sh` /
+`import_kb_seed.sh` permiten precomputar el corpus dado UNA vez (filas de Postgres +
+volumen Docker de Chroma) y restaurarlo en arranques futuros en vez de recalcular los
+embeddings -- ver esos scripts para el detalle. No debilita G5 (la compuerta de
+actualizacion en vivo de la base de conocimiento): esa se prueba con un documento que NO
+esta en este seed, asi que el pipeline de ingesta real sigue teniendo que funcionar en
+vivo de todas formas.
 
 ## Modelo declarado (compuerta G3)
 
@@ -84,6 +108,8 @@ docs/                         Diagramas, especificaciones OpenAPI
 specs/                        Plan de implementacion y spec original del reto
 scripts/setup.sh              Bootstrap de un solo comando
 scripts/bulk_ingest_corpus.py Carga masiva del corpus dado a la base de conocimiento (idempotente)
+scripts/export_kb_seed.sh     Snapshot de un corpus ya cargado (Postgres + volumen Chroma) en un archivo local
+scripts/import_kb_seed.sh     Restaura ese snapshot -- usado automaticamente por setup.sh si el archivo existe
 ```
 
 ## Desarrollo

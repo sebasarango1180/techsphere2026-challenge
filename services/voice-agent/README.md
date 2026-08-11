@@ -68,7 +68,13 @@ across more assets here:
 - **Kokoro TTS pipeline** (`app/providers/tts.py`) -- `_get_pipeline()`'s `lru_cache`
   already meant the model loads once per process rather than once per call; `prewarm()`
   now also calls it via a public `warm_up()` so that one load happens before the first
-  call is dispatched, not during it.
+  call is dispatched, not during it. Separately, found a real device bug while auditing
+  Metal usage: Kokoro's own `KPipeline.__init__` auto-selects a device with `'cuda' if
+  torch.cuda.is_available() else 'cpu'` -- no MPS branch at all, so it silently ran on
+  CPU even in native-agent mode (macOS, specifically to get Metal). Fixed by explicitly
+  passing `device='mps'` when available (`_pick_device()`); verified live: model loads
+  onto `mps:0`, and per-synthesis latency dropped from ~2.6s to ~1.2s (warm, averaged
+  over 3 calls).
 - **faster-whisper (local STT mode)** -- found a real bug here, not just a missing
   prewarm: `LocalWhisperSTT` stored its `WhisperModel` on `self`, but `get_stt()` runs
   inside `entrypoint()` (once per *call*, not per process), so every single call in local
@@ -94,6 +100,57 @@ across more assets here:
 cache it took ~111s, dominated by Kokoro's one-time ~2GB weight download from Hugging
 Face -- a real cost, but paid once per worker process at startup rather than by whichever
 patient's call happens to be first.
+
+## Conversation script
+
+The call now follows a fixed structure, matching what the reference dataset's real
+conversations actually do (`docs/dataset-eda.md` §2: every `capa1_limpia` conversation
+has exactly 12 turns, always the same 6-question order, `std=0.0` -- not a loose
+pattern):
+
+- **Greeting**: spoken VERBATIM (`GREETING_ES` in `app/prompts.py`) via
+  `AgentSession.say()` in a new `PostSurgicalAgent.on_enter()` hook, not asked of the
+  LLM as an instruction -- a ~3.8B model told to "greet the patient like this" will
+  paraphrase, and this exact wording is a hard requirement. Waits for
+  `SpeechHandle.wait_for_playout()` before triggering the first question, so they don't
+  overlap.
+- **Fixed six-topic order**: `ClinicalSnapshot.next_missing_topic()` walks pain → fever →
+  mobility → wound → appetite → sleep (docs/dataset-eda.md's exact order) and returns the
+  next unanswered one; injected into the LLM's context every turn (`on_user_turn_completed`)
+  and used directly for the post-greeting and post-silence prompts (`_prompt_next_topic()`).
+  This reverses the previous prompt, which explicitly told the model order didn't matter
+  ("no hace falta preguntarlo en ese orden") -- overruled once it became clear the
+  reference dataset's real agent turns never bundle or reorder topics.
+- **~2s silence → continue**: `AgentSession(user_away_timeout=2.0, ...)` +
+  a `user_state_changed` handler that calls `_prompt_next_topic()` when state becomes
+  `"away"`. Confirmed via the installed package's source that `user_away_timeout` only
+  sets user state, it doesn't itself continue the conversation -- that's this handler's
+  job. Deliberately not the same knob as end-of-speech detection (how long to wait after
+  the patient STOPS talking mid-answer, which is `turn_detection`/VAD's job) -- this is
+  "never started answering at all".
+- **Tone adaptation**: a new prompt rule asks the model to mirror the patient's register
+  (more relaxed if the patient is informal, more formal if not) without becoming
+  unprofessional or using unnecessary medical jargon.
+
+All of the above verified via introspection against the real installed `livekit-agents`
+API (`on_enter`, `session.say`/`generate_reply`, `SpeechHandle.wait_for_playout`,
+`user_away_timeout`/`UserState`/`user_state_changed` semantics all confirmed from source,
+not guessed) and via direct unit tests of `next_missing_topic()`'s ordering.
+
+Now also verified against a real live call: first attempt was **completely silent** --
+no greeting, no replies, and it looked like STT wasn't working either. Root cause, found
+in the logs, was much simpler than it first looked: `.env` had `TTS_VOICE=es` (both
+`.env` and `.env.example` did -- a plausible-looking but wrong guess, baked in from
+early scaffolding), which 404s fetching `voices/es.pt` from hexgrad/Kokoro-82M and
+silently kills every single TTS call. The conversation logic itself was working
+correctly the whole time -- log evidence shows it dutifully advancing through the
+greeting, then pain, then fever, right on the ~2s silence timeout, every ~2-3 minutes,
+just never producing audio for any of it (each attempt logged `failed to synthesize
+speech: no audio frames were pushed`, retried, gave up, moved on). Fixed: `TTS_VOICE`
+now defaults to `ef_dora`, the actual correct value `app/config.py` already had as its
+Python-level default before `.env` overrode it -- verified against Kokoro-82M's real
+`voices/` file listing (`ef_dora`, `em_alex`, `em_santa` are the only real Spanish
+voices), and confirmed live: a direct synthesis call now returns real, non-empty audio.
 
 Still **not** run against a live LiveKit room + Ollama end to end. Before trusting it in
 a demo:

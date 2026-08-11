@@ -1,35 +1,32 @@
 """voice-agent entrypoint: joins a LiveKit room as a participant and runs the pipeline
-described in specs/implementation-plan.md §4.3:
+described in specs/implementation-plan.md §4.3, REWORKED from the original per-turn
+design after finding, live, that concurrent per-turn LLM classification calls were
+contending with the conversational LLM call for the same local Ollama instance, causing
+real timeouts and dropped connections during live calls:
 
     VAD end-of-speech
       -> STT(audio) -> text                                   [Track: STT]
       -> POST vector-store/search(text)                       [retrieval]
-      -> build prompt (system + citations + history window + running clinical snapshot)
+      -> build prompt (system + citations + next scripted topic)
       -> Ollama generate, streamed                             [Track A: spoken reply -> TTS per-sentence]
-      -> Ollama classify, JSON-mode                             [Track B: triage + clinical signals]
-      -> deterministic red-flag check(text)                     [rule layer]
-      -> final_triage = max(Track B, rule layer)
-      -> merge signals into running snapshot, persist turn + snapshot + escalation (if any)
-      -> on call end: summarize -> finalize call_summaries
+      -> deterministic red-flag check(text)                     [rule layer, per turn, NOT an LLM call]
+      -> if rule layer fires: escalate immediately
+      -> advance to the next scripted topic (turn counter, not LLM-dependent)
+      -> on call end: ONE comprehensive LLM pass over the full transcript
+           -> six clinical signals + triage classification + narrative summary
+      -> final_triage = max(end-of-call model classification, worst rule-layer match seen)
+      -> persist snapshot + final triage + call summary
 
 Track A (the spoken reply) is handled automatically by AgentSession once wired with our
 STT/LLM/TTS/VAD providers -- that's the whole point of building on livekit-agents (plan
 §1). Everything specific to this agent lives in `PostSurgicalAgent.on_user_turn_completed`
-(retrieval + injecting the running clinical snapshot + kicking off Track B) and the
-session event handlers below (persistence).
+(retrieval + rule-layer safety net + next-topic steering) and `summarize_call` (the
+end-of-call classification pass).
 
-The agent's job, stated plainly (this is what on_user_turn_completed/_track_b/decision.py
-are actually for): lead a routine post-op check-in conversation, and PRIVATELY infer
-whether medical staff should be notified -- the triage classification is never spoken to
-the patient (see app/prompts.py's docstring), it drives app/decision.py's escalation
-logic and the call summary instead.
-
-TODO(workstream C): this file is unverified against a live LiveKit room + running Ollama
--- it's built from livekit-agents' actual installed API (verified via introspection, not
-guessed), but integration bugs are still likely on first real run. Prioritize testing:
-1) does on_user_turn_completed's injected context actually reach the LLM call, 2) do the
-ChatMessage.metrics fields populate as documented, 3) the room-metadata parsing in
-app/call_context.py against a real api-gateway-created room.
+The agent's job, stated plainly: lead a routine post-op check-in conversation, and
+PRIVATELY infer whether medical staff should be notified -- the triage classification is
+never spoken to the patient (see app/prompts.py's docstring), it drives
+app/decision.py's escalation logic and the call summary instead.
 """
 
 import asyncio
@@ -44,6 +41,7 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     ModelSettings,
+    StopResponse,
     WorkerOptions,
     cli,
 )
@@ -52,9 +50,15 @@ from livekit.plugins import silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from app import call_context, db, decision, retrieval
-from app.clinical_snapshot import ClinicalSnapshot
+from app.clinical_snapshot import QUESTION_ORDER, ClinicalSnapshot, topic_hint
 from app.config import settings
-from app.prompts import CLASSIFICATION_PROMPT_ES, build_context_prompt, build_instructions
+from app.prompts import (
+    FINAL_CLASSIFICATION_PROMPT_ES,
+    GREETING_ES,
+    PATHOLOGY_VALIDATION_PROMPT_ES,
+    build_context_prompt,
+    build_instructions,
+)
 from app.providers.llm import get_llm
 from app.providers.stt import get_stt
 from app.providers.stt import warm_up as stt_warm_up
@@ -67,38 +71,199 @@ logger = logging.getLogger(__name__)
 
 
 class PostSurgicalAgent(Agent):
-    def __init__(self, *, call_ctx: call_context.CallContext, instructions: str) -> None:
+    def __init__(self, *, call_ctx: call_context.CallContext, instructions: str, job_ctx: JobContext) -> None:
         super().__init__(instructions=instructions)
         self.call_ctx = call_ctx
+        self._job_ctx = job_ctx
+        # Six-signal extraction now happens ONCE at call end (see module docstring) --
+        # this snapshot is populated by summarize_call, not incrementally per turn.
         self.snapshot = ClinicalSnapshot()
+        # Conversation flow: a plain turn counter through the fixed six-topic order
+        # (docs/dataset-eda.md §2), advanced unconditionally after every patient turn or
+        # silence timeout -- deliberately NOT dependent on any LLM call succeeding
+        # (the old snapshot-driven version would silently stall on the same topic
+        # whenever its per-turn classification call failed/timed out -- found live: the
+        # agent repeating the same question, directly caused by this dependency).
+        self.topic_index = 0
+        # Set once every QUESTION_ORDER topic has been asked at least once (topic_index
+        # has run past the end) -- does NOT by itself mean the call is closing. See
+        # _prompt_next_topic's docstring: once script_done, we check whether the patient
+        # actually gave usable answers before deciding to say goodbye, since the plain
+        # turn-counter above can't tell "answered" from "STT caught a stray noise/word"
+        # or "this turn was a clarification, not a new topic" -- found live, both look
+        # identical from turn-counting alone and could silently skip a real topic.
+        self.script_done = False
+        # Guards the ONE makeup round (see _prompt_next_topic) against repeating --
+        # bounded so an unclear/uncooperative patient answer can never keep the call
+        # open indefinitely.
+        self.makeup_attempted = False
+        # Set once the farewell has been triggered -- guards on_user_turn_completed and
+        # the user_state_changed handler against firing again afterward. Found live:
+        # without this, the session stayed open after the farewell, and a stray
+        # post-goodbye utterance (or even just the away-timeout re-firing) could trigger
+        # another generate_reply -- and because the base system prompt describes the
+        # full six-topic script, the model would sometimes start back through it instead
+        # of just repeating the goodbye. See _prompt_next_topic.
+        self.closing = False
+        # Deterministic rule-layer's worst finding across the WHOLE call (not just the
+        # latest turn) -- fed into the end-of-call fusion in summarize_call. A rule
+        # match still escalates immediately when found (see on_user_turn_completed);
+        # this is what lets the end-of-call classification also reflect it.
+        self.worst_rule_match: decision.RuleMatch | None = None
         self._background_tasks: set[asyncio.Task] = set()
+
+    async def on_enter(self) -> None:
+        """Runs once, right when the agent joins the call (livekit-agents' official
+        hook) -- this is where the mandatory greeting lives. Spoken verbatim via
+        `session.say()`, NOT asked of the LLM as an instruction: a ~3.8B model told to
+        "greet the patient like this" will paraphrase it, and this exact wording is a
+        hard requirement, not a style guide. Waits for the greeting to finish playing
+        (`wait_for_playout`) before triggering the first scripted question, so the two
+        don't overlap -- "as soon as the greeting ends, start asking questions".
+        """
+        handle = self.session.say(GREETING_ES)
+        await handle.wait_for_playout()
+        await self._prompt_next_topic()
+
+    async def _prompt_next_topic(self) -> None:
+        """Triggers the LLM to naturally phrase the CURRENT scripted question
+        (self.topic_index into QUESTION_ORDER), or -- once past the last one -- runs the
+        one-time missing-topic makeup check before saying goodbye and ending the call.
+        Callers are responsible for not invoking this again once self.closing is set
+        (see the user_state_changed handler in entrypoint())."""
+        if not self.script_done:
+            topic = topic_hint(self.topic_index)
+            if topic:
+                self.session.generate_reply(
+                    instructions=f"Pregunta de forma natural y breve sobre: {topic}. Solo ese tema, no menciones los demas."
+                )
+                return
+            self.script_done = True
+
+        # All six scripted topics have been asked at least once. Before closing, run the
+        # SAME end-of-call extraction summarize_call would run anyway, but here, live,
+        # purely to check whether the patient's answers actually covered all six signals
+        # -- this is what "if the agent considers a question hasn't been answered, it
+        # should be able to introduce it again before closing" needs: the turn-counter
+        # above can advance without a real answer (STT noise, a clarification exchange
+        # eating a slot), so it alone can't be trusted to know what's actually missing.
+        # Bounded to ONE makeup round (self.makeup_attempted) so a still-unclear answer
+        # can't keep the call open indefinitely -- whatever's left after that is simply
+        # recorded as missing (summarize_call's own end-of-call pass runs again anyway,
+        # on the complete final transcript, and is the actual source of truth persisted
+        # to the DB; this is only for deciding whether to ask again live).
+        if not self.makeup_attempted:
+            self.makeup_attempted = True
+            transcript = "\n".join(f"{m.role}: {m.text_content}" for m in self.session.history.messages)
+            classification = await _classify_full_call(transcript, self.call_ctx.call_id)
+            self.snapshot.merge(classification)
+            missing = self.snapshot.missing_fields()
+            if missing:
+                logger.info("call_id=%s makeup round for missing: %s", self.call_ctx.call_id, missing)
+                self.session.generate_reply(
+                    instructions=(
+                        f"Antes de cerrar la llamada, todavia falta esta informacion: {', '.join(missing)}. "
+                        "Preguntala de forma breve y natural, un tema a la vez si son varios, antes de despedirte."
+                    )
+                )
+                return
+
+        # Ending the call HERE, ourselves, rather than leaving the session open waiting
+        # on the patient to hang up, is what actually fixes the restart bug (see module
+        # docstring) -- and as a side effect guarantees the end-of-call classification
+        # (summarize_call, registered as a shutdown callback in entrypoint()) runs
+        # promptly, instead of depending on however/whenever the patient's client
+        # disconnects.
+        self.closing = True
+        handle = self.session.generate_reply(
+            instructions="Ya preguntaste todos los temas necesarios. Cierra la llamada agradeciendo al paciente, en una frase."
+        )
+        await handle.wait_for_playout()
+        self._job_ctx.shutdown(reason="chequeo completo")
 
     async def on_user_turn_completed(self, turn_ctx: ChatContext, new_message: ChatMessage) -> None:
         """Called after STT finalizes the patient's turn, before the LLM generates a
-        reply -- this is where retrieval happens and gets injected into context (plan
-        §4.3's "retrieval" + "build prompt" steps)."""
+        reply -- retrieval + the deterministic real-time safety net + next-topic
+        steering all happen here (plan §4.3)."""
+        if self.closing:
+            # Already wrapping up (farewell in flight or spoken) -- a plain `return`
+            # here would still let the framework auto-generate its normal per-turn
+            # reply; StopResponse is what actually suppresses that (see
+            # _prompt_next_topic's docstring for why letting any further reply happen
+            # here was the root cause of the call restarting itself after goodbye).
+            raise StopResponse()
         patient_text = new_message.text_content or ""
         if not patient_text.strip():
             return
 
-        chunks = await retrieval.search(patient_text, category_hint=self.call_ctx.category)
+        # Found live: an unguarded retrieval.search() call that times out (vector-store
+        # and this process's own Kokoro pipeline both compete for the same Metal GPU --
+        # a transient spike is real, not hypothetical) used to take down this WHOLE
+        # method, silently dropping not just the KB context but also the next-topic
+        # steering below. Degrade to empty context instead; the turn still proceeds.
+        try:
+            chunks = await retrieval.search(patient_text, category_hint=self.call_ctx.category)
+        except Exception:
+            logger.exception("retrieval.search failed for call_id=%s -- continuing without KB context this turn", self.call_ctx.call_id)
+            chunks = []
         context_block = build_context_prompt(retrieval.format_for_prompt(chunks), category=self.call_ctx.category)
         turn_ctx.add_message(role="system", content=context_block)
 
-        # "Context at any point in time": the agent's own running read of this call so
-        # far, so it doesn't re-ask something already established earlier in the SAME
-        # call (plan §2.10). Only added once there's something to say.
-        if self.snapshot.has_any():
-            turn_ctx.add_message(
-                role="system",
-                content=f"Lo que ya sabes de esta llamada: {self.snapshot.render_es()}.",
+        # Deterministic rule layer -- NOT an LLM call, cheap, runs every turn for
+        # real-time safety regardless of when the model-based classification happens
+        # (see module docstring). Escalates immediately on a match; also tracked as the
+        # running worst-of-the-call for the end-of-call fusion (summarize_call).
+        rule_match = decision.rule_based_triage(patient_text, self.call_ctx.category)
+        if rule_match is not None:
+            if self.worst_rule_match is None or decision.TRIAGE_ORDER[rule_match.level] > decision.TRIAGE_ORDER[self.worst_rule_match.level]:
+                self.worst_rule_match = rule_match
+            await db.insert_escalation(
+                call_id=self.call_ctx.call_id,
+                level=rule_match.level,
+                rationale=rule_match.rationale,
+                triggered_by="rule",
+                cited_documents=[
+                    {"chunk_id": c.chunk_id, "document_id": c.document_id, "page": c.page}
+                    for c in chunks
+                ],
+            )
+            logger.info(
+                "real-time rule-layer escalation call_id=%s level=%s",
+                self.call_ctx.call_id, rule_match.level,
             )
 
-        # Track B (classification) + rule layer + fusion + persistence run in the
-        # background so they never add latency to Track A's spoken reply (plan §2.3).
-        task = asyncio.create_task(self._track_b(patient_text, chunks))
+        # Steers the reply toward the fixed six-topic script (docs/dataset-eda.md §2),
+        # then advances -- unconditionally, regardless of whether the patient's answer
+        # seemed to address the topic (app/prompts.py's SYSTEM_PROMPT_ES asks the model
+        # to make one genuine clarifying attempt within its own reply first; this
+        # counter guarantees the call moves on either way, never gets stuck repeating).
+        # Only runs before script_done -- once true, _prompt_next_topic's own makeup-
+        # round / closing logic takes over (see below) and no further "next tema
+        # pendiente" hint is needed here.
+        if not self.script_done:
+            next_topic = topic_hint(self.topic_index)
+            self.topic_index += 1
+            if next_topic:
+                turn_ctx.add_message(
+                    role="system",
+                    content=f"Siguiente tema pendiente por preguntar (en este orden, uno a la vez): {next_topic}.",
+                )
+                return
+
+        # Either the six scripted topics just finished, or this turn was the patient's
+        # answer during the makeup round (script_done already True from a prior turn).
+        # Either way, suppress the framework's normal automatic reply for THIS turn and
+        # hand off to _prompt_next_topic, which decides whether a makeup round is still
+        # needed or it's time to say goodbye and end the call. Found live: letting this
+        # turn's own automatic reply say goodbye AND leaving the session open afterward
+        # meant nothing ever called ctx.shutdown() -- a later away-timeout firing could
+        # trigger a second, uncoordinated farewell, and worse, since the base system
+        # prompt describes the full six-topic script, the model would sometimes drift
+        # back into it instead of just repeating the goodbye.
+        task = asyncio.ensure_future(self._prompt_next_topic())
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        raise StopResponse()
 
     async def llm_node(self, chat_ctx: ChatContext, tools: list, model_settings: ModelSettings):
         """Overrides the default llm_node purely to pipe its output through
@@ -109,79 +274,169 @@ class PostSurgicalAgent(Agent):
         async for piece in strip_reasoning(default_stream):
             yield piece
 
-    async def _track_b(self, patient_text: str, chunks: list[retrieval.RetrievedChunk]) -> None:
-        try:
-            classification = await classify_triage(patient_text, retrieval.format_for_prompt(chunks))
-        except Exception:
-            logger.exception("Track B classification failed for call_id=%s", self.call_ctx.call_id)
-            classification = {"triage": "verde", "confidence": 0.0}
-
-        # Merge this turn's signals into the running picture and persist it -- every
-        # turn, not just escalating ones, so the snapshot is complete "at any point in
-        # time" (durable half in app/db.py, in-memory half is self.snapshot itself).
-        self.snapshot.merge(classification)
-        await db.upsert_clinical_snapshot(self.call_ctx.call_id, self.snapshot)
-
-        rule_match = decision.rule_based_triage(patient_text, self.call_ctx.category)
-        fused = decision.fuse(
-            classification.get("triage", "verde"),
-            f"clasificacion del modelo (confianza={classification.get('confidence', 0)})",
-            rule_match,
-        )
-
-        if fused.level != "verde":
-            await db.insert_escalation(
-                call_id=self.call_ctx.call_id,
-                level=fused.level,
-                rationale=fused.rationale,
-                triggered_by=fused.triggered_by,
-                cited_documents=[
-                    {"chunk_id": c.chunk_id, "document_id": c.document_id, "page": c.page}
-                    for c in chunks
-                ],
-            )
-            logger.info(
-                "escalation call_id=%s level=%s triggered_by=%s",
-                self.call_ctx.call_id, fused.level, fused.triggered_by,
-            )
-
-
-async def classify_triage(patient_text: str, retrieved_context: str) -> dict:
-    """Track B: a concise structured pass over the latest turn via Ollama's JSON mode.
-    Deliberately a separate, minimal HTTP call rather than reusing the AgentSession's LLM
-    plugin -- we just need one JSON completion, not the conversational streaming machinery.
-    """
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(
-            f"{settings.ollama_host}/api/chat",
-            json={
-                "model": settings.ollama_model,
-                "messages": [
-                    {"role": "system", "content": CLASSIFICATION_PROMPT_ES},
-                    {
-                        "role": "user",
-                        "content": f"Contexto clinico:\n{retrieved_context}\n\nLo que dijo el paciente:\n{patient_text}",
-                    },
-                ],
-                "format": "json",
-                "stream": False,
-            },
-        )
-        resp.raise_for_status()
-        content = resp.json()["message"]["content"]
-        return json.loads(content)
-
 
 async def summarize_call(session: AgentSession, agent: PostSurgicalAgent) -> None:
-    """On call end: generate the narrative fields the required call summary needs
-    (symptoms_reported, decision, next_steps) -- the six structured signals are already
-    persisted incrementally via upsert_clinical_snapshot, this only fills in the rest
-    (plan §4.3's last step)."""
+    """On call end: the ONE comprehensive classification pass (see module docstring for
+    why this moved here from per-turn) -- six clinical signals + triage classification
+    over the FULL transcript, plus the narrative summary fields. Two separate LLM calls
+    (classification, then narrative) rather than one combined prompt: keeps
+    FINAL_CLASSIFICATION_PROMPT_ES focused (small-model prompt-adherence reasons, see
+    app/prompts.py's module docstring) and means a narrative-generation hiccup can't
+    take down the classification that actually matters for escalation.
+    """
     call_id = agent.call_ctx.call_id
     transcript = "\n".join(f"{m.role}: {m.text_content}" for m in session.history.messages)
     if not transcript.strip():
+        await db.mark_call_completed(call_id)
         return
 
+    classification = await _classify_full_call(transcript, call_id)
+    agent.snapshot.merge(classification)
+    await db.upsert_clinical_snapshot(call_id, agent.snapshot)
+
+    # Pathology validation: a SEPARATE call (see PATHOLOGY_VALIDATION_PROMPT_ES's
+    # docstring for why it isn't folded into the classification call above), grounded by
+    # a retrieval against the just-extracted six-signal snapshot rather than the raw
+    # transcript -- a compact, structured query ("dolor 9/10, apetito muy_disminuido...")
+    # returns more targeted chunks than the whole conversation would. Separate from the
+    # live per-turn retrieval in on_user_turn_completed (per-topic, one turn at a time).
+    try:
+        kb_chunks = await retrieval.search(agent.snapshot.render_es(), top_k=8, category_hint=agent.call_ctx.category)
+    except Exception:
+        logger.exception("end-of-call retrieval.search failed for call_id=%s -- skipping pathology validation", call_id)
+        kb_chunks = []
+    pathology = await _validate_pathology(agent.snapshot, kb_chunks, agent.call_ctx.category, call_id)
+
+    # fuse() takes ONE rule match -- agent.worst_rule_match is already the running worst
+    # across every turn of the call (app/main.py's on_user_turn_completed), so this is
+    # still "max(model, worst rule finding)" over the whole call, not just this pass.
+    fused = decision.fuse(
+        classification.get("triage", "verde"),
+        classification.get("rationale") or f"clasificacion del modelo (confianza={classification.get('confidence', 0)})",
+        agent.worst_rule_match,
+    )
+    # An explicit empty list from the model ("nothing missing") is meaningful and
+    # different from the key being absent -- `or` would wrongly treat both the same way,
+    # so check for None specifically before falling back to the snapshot's own view.
+    model_missing_info = classification.get("missing_info")
+
+    # Map the model's self-reported chunk_id citations back to full {chunk_id,
+    # document_id, page} dicts (same shape as insert_escalation's cited_documents) --
+    # only chunk_ids that were actually offered in kb_chunks are kept, so a hallucinated
+    # id can't produce a fabricated citation.
+    chunks_by_id = {c.chunk_id: c for c in kb_chunks}
+    pathology_citations = pathology.get("pathology_citations")
+    if not isinstance(pathology_citations, list):
+        pathology_citations = []
+    # Includes the chunk's own text (not just its id/page) -- the admin console's
+    # evidence chips (app/frontend/admin-console) let a reviewer click straight through
+    # to what the knowledge base actually said, without a separate document-fetch
+    # endpoint or round-trip back to vector-store.
+    pathology_evidence = [
+        {"chunk_id": c.chunk_id, "document_id": c.document_id, "page": c.page, "text": c.text}
+        for cid in pathology_citations
+        if isinstance(cid, str) and (c := chunks_by_id.get(cid)) is not None
+    ]
+
+    await db.finalize_triage(
+        call_id=call_id,
+        level=fused.level,
+        rationale=fused.rationale,
+        confidence=classification.get("confidence"),
+        missing_info=model_missing_info if model_missing_info is not None else agent.snapshot.missing_fields(),
+        pathology_assessment=_coerce_text(pathology.get("pathology_assessment")),
+        pathology_evidence=pathology_evidence,
+    )
+    if fused.level != "verde":
+        logger.info("final call classification call_id=%s level=%s triggered_by=%s", call_id, fused.level, fused.triggered_by)
+
+    # Narrative summary is a "nice to have" on top of the triage/six-signal data already
+    # persisted above -- a failure here (LLM call error, or the model returning a field
+    # in a shape asyncpg can't write to a text column, found live: "symptoms_reported"
+    # coming back as a nested object instead of a string) must not prevent
+    # mark_call_completed below, or a call whose actual clinical data was saved fine
+    # would be left stuck "active" forever, looking like the whole pipeline failed.
+    try:
+        summary = await _generate_narrative_summary(transcript, call_id)
+        await db.finalize_call_summary(
+            call_id=call_id,
+            procedure=agent.call_ctx.procedure or agent.call_ctx.category,
+            symptoms_reported=_coerce_text(summary.get("symptoms_reported")),
+            decision=_coerce_text(summary.get("decision")),
+            references=None,  # TODO(workstream C): aggregate cited_documents across the call's escalations
+            next_steps=_coerce_text(summary.get("next_steps")),
+        )
+    except Exception:
+        logger.exception("finalize_call_summary failed for call_id=%s -- triage/signals already saved, continuing", call_id)
+
+    await db.mark_call_completed(call_id)
+
+
+def _coerce_text(value: object) -> str | None:
+    """Model-returned JSON is not guaranteed to match the requested schema (found live,
+    more than once: a field meant to be a plain string coming back as a nested object)
+    -- coerce to a readable string instead of letting an unexpected type crash the
+    Postgres write that's supposed to be the reliable, durable half of this pipeline."""
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+async def _classify_full_call(transcript: str, call_id: str) -> dict:
+    """The end-of-call classification call -- see FINAL_CLASSIFICATION_PROMPT_ES's
+    docstring for why this runs once, here, instead of per-turn."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{settings.ollama_host}/api/chat",
+                json={
+                    "model": settings.ollama_model,
+                    "messages": [
+                        {"role": "system", "content": FINAL_CLASSIFICATION_PROMPT_ES},
+                        {"role": "user", "content": transcript},
+                    ],
+                    "format": "json",
+                    "stream": False,
+                },
+            )
+            resp.raise_for_status()
+            return json.loads(resp.json()["message"]["content"])
+    except Exception:
+        logger.exception("end-of-call classification failed for call_id=%s -- defaulting to verde/low-confidence", call_id)
+        return {"triage": "verde", "confidence": 0.0, "missing_info": ["clasificacion fallo, ver logs"]}
+
+
+async def _validate_pathology(
+    snapshot: ClinicalSnapshot, kb_chunks: list[retrieval.RetrievedChunk], category: str | None, call_id: str
+) -> dict:
+    """KB-grounded pathology validation -- see PATHOLOGY_VALIDATION_PROMPT_ES's docstring
+    for why this is a separate call from _classify_full_call rather than extra fields on
+    it (found live: folding both into one prompt broke schema adherence on this small a
+    model, worse once a KB context block was also present)."""
+    kb_context = build_context_prompt(retrieval.format_for_prompt(kb_chunks), category=category)
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{settings.ollama_host}/api/chat",
+                json={
+                    "model": settings.ollama_model,
+                    "messages": [
+                        {"role": "system", "content": PATHOLOGY_VALIDATION_PROMPT_ES},
+                        {"role": "system", "content": kb_context},
+                        {"role": "user", "content": f"Hallazgos: {snapshot.render_es()}"},
+                    ],
+                    "format": "json",
+                    "stream": False,
+                },
+            )
+            resp.raise_for_status()
+            return json.loads(resp.json()["message"]["content"])
+    except Exception:
+        logger.exception("pathology validation failed for call_id=%s", call_id)
+        return {}
+
+
+async def _generate_narrative_summary(transcript: str, call_id: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(
@@ -204,20 +459,10 @@ async def summarize_call(session: AgentSession, agent: PostSurgicalAgent) -> Non
                 },
             )
             resp.raise_for_status()
-            summary = json.loads(resp.json()["message"]["content"])
+            return json.loads(resp.json()["message"]["content"])
     except Exception:
-        logger.exception("call summary generation failed for call_id=%s", call_id)
-        summary = {}
-
-    await db.finalize_call_summary(
-        call_id=call_id,
-        procedure=agent.call_ctx.procedure or agent.call_ctx.category,
-        symptoms_reported=summary.get("symptoms_reported"),
-        decision=summary.get("decision"),
-        references=None,  # TODO(workstream C): aggregate cited_documents across the call's escalations
-        next_steps=summary.get("next_steps"),
-    )
-    await db.mark_call_completed(call_id)
+        logger.exception("narrative summary generation failed for call_id=%s", call_id)
+        return {}
 
 
 def prewarm(proc: JobProcess) -> None:
@@ -313,7 +558,52 @@ async def entrypoint(ctx: JobContext) -> None:
         tts=TTS(),
         vad=vad,
         turn_detection=MultilingualModel(),
+        # If the patient goes quiet (no speech AND no agent speech) for this long,
+        # livekit-agents marks user_state "away" -- the handler below turns that into
+        # "move on" rather than waiting indefinitely. NOT the same knob as end-of-speech
+        # detection (how long to wait after the patient STOPS talking mid-answer, which
+        # is turn_detection/VAD's job) -- this is "never started answering at all".
+        # Confirmed via the installed package: user_away_timeout only sets user state, it
+        # doesn't itself continue the conversation -- that's this handler's job.
+        #
+        # Was 2.0s -- found live (real call transcript) that this was too aggressive: a
+        # post-surgical patient taking a natural moment to process a question and start
+        # answering could get moved past before they'd said anything, which read as the
+        # agent "skipping ahead without waiting for an answer". livekit-agents' own
+        # default is 15.0s; 6s is a middle ground -- enough real thinking time without
+        # letting a genuinely silent patient hang the call for too long.
+        user_away_timeout=6.0,
     )
+
+    agent = PostSurgicalAgent(
+        call_ctx=call_ctx,
+        instructions=build_instructions(call_ctx, prior_snapshot_es),
+        job_ctx=ctx,
+    )
+
+    @session.on("user_state_changed")
+    def _on_user_state(event: agents.UserStateChangedEvent) -> None:
+        if event.new_state != "away" or agent.closing:
+            return
+        task = asyncio.ensure_future(agent._prompt_next_topic())
+        agent._background_tasks.add(task)
+        task.add_done_callback(agent._background_tasks.discard)
+
+    @session.on("close")
+    def _on_session_close(event: agents.CloseEvent) -> None:
+        # AgentSession closes itself (RoomInputOptions.close_on_disconnect defaults to
+        # True) when the patient disconnects -- but by default it does NOT delete or
+        # leave the room (delete_room_on_close defaults to False), so the job's own
+        # shutdown callback (summarize_call, registered below) would otherwise never
+        # fire in that case: confirmed by reading livekit-agents' own job process code,
+        # the ONLY thing that reliably triggers it is either OUR OWN ctx.shutdown() call
+        # (see _prompt_next_topic) or the agent's Room object itself receiving a
+        # "disconnected" event, neither of which a bare session close causes on its own.
+        # This is what makes "the final analysis must happen even after the call has
+        # been finished" true regardless of who ends the call or how -- not just for our
+        # own farewell-triggered close.
+        logger.info("call_id=%s session closed (reason=%s) -- ensuring job shutdown runs", call_ctx.call_id, event.reason)
+        ctx.shutdown(reason=f"session closed: {event.reason}")
 
     @session.on("conversation_item_added")
     def _on_item(event: agents.ConversationItemAddedEvent) -> None:
@@ -333,11 +623,6 @@ async def entrypoint(ctx: JobContext) -> None:
                 tts_ms=_ms(metrics.get("tts_node_ttfb")),
             )
         )
-
-    agent = PostSurgicalAgent(
-        call_ctx=call_ctx,
-        instructions=build_instructions(call_ctx, prior_snapshot_es),
-    )
 
     await session.start(agent=agent, room=ctx.room)
 
@@ -359,5 +644,20 @@ if __name__ == "__main__":
             ws_url=settings.livekit_url,
             api_key=settings.livekit_api_key,
             api_secret=settings.livekit_api_secret,
+            # Worker's own internal HTTP server (health/metrics, not anything
+            # api-gateway or a frontend calls) defaults to a FIXED port 8081 in "start"
+            # mode (0 = random free port only in "dev" mode) -- found live, colliding
+            # with an unrelated project's container also using 8081 on this machine.
+            # Nothing depends on this port being any particular number, so always use a
+            # random free one regardless of dev/start mode.
+            port=0,
+            # Default is 10s -- found live that this is nowhere near enough for OUR
+            # prewarm_fnc, which can legitimately take ~111s on a cold cache (Kokoro's
+            # ~2GB weight download, see prewarm()'s docstring) and multiple worker
+            # processes (num_idle_processes, default 4) run it concurrently at startup,
+            # contending for the same bandwidth/CPU -- a process that hits this timeout
+            # gets killed and retried, not just delayed. Generous margin over the worst
+            # measured cold-cache time.
+            initialize_process_timeout=300.0,
         )
     )

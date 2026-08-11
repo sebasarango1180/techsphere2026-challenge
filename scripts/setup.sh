@@ -66,6 +66,11 @@ fi
 if [ "$MODE" = "native" ]; then
   command -v uv >/dev/null 2>&1 || die "uv is required for native mode: https://docs.astral.sh/uv/getting-started/installation/"
   command -v ollama >/dev/null 2>&1 || die "ollama is required for native mode: https://ollama.com/download"
+  # vector-store also runs natively in this mode now (moved out of Docker to get Metal
+  # for BGE-M3 -- Docker Desktop can't pass through Metal no matter what; see
+  # docker-compose.yml's top comment). Its OCR fallback shells out to tesseract, baked
+  # into its Dockerfile for Docker mode but not present on a bare host.
+  command -v tesseract >/dev/null 2>&1 || die "tesseract is required for native mode (vector-store's OCR fallback): brew install tesseract tesseract-lang"
 fi
 
 # ---------------------------------------------------------------------------
@@ -125,13 +130,28 @@ fi
 COMPOSE_BAKE=true docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" build --parallel &
 PID_BUILD=$!
 
-# postgres:16-alpine (~411MB) and livekit/livekit-server (~116MB) are stock images, no
-# `build:` key -- `build --parallel` above doesn't touch them at all, so without this
-# they'd only get pulled at `up -d` in step 5, serially after everything else here is
-# already done. Same gap as ollama/vector-store, smaller in absolute size but the same
-# "every heavy pull must be early and parallel, not an afterthought" principle.
-docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" pull postgres livekit &
+# postgres:16-alpine (~411MB), livekit/livekit-server (~116MB), and chromadb/chroma are
+# stock images, no `build:` key -- `build --parallel` above doesn't touch them at all,
+# so without this they'd only get pulled at `up -d` in step 5, serially after everything
+# else here is already done. Same gap as ollama/vector-store, smaller in absolute size
+# but the same "every heavy pull must be early and parallel, not an afterthought"
+# principle. chroma is tagged "tqida" (always on, both modes -- see docker-compose.yml's
+# top comment: it does no GPU/Metal work, so it never needed to leave Docker).
+docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" pull postgres livekit chroma &
 PID_PULL_STOCK_IMAGES=$!
+
+# Postgres also needs to be up EARLY now (not just pulled) -- scripts/import_kb_seed.sh
+# (see below) restores a pre-computed KB seed into it when one's present, and that has
+# to happen before vector-store's own startup touches it. Cheap either way: it's a stock
+# image already being pulled above, this just moves *when* `up -d postgres` happens.
+#
+# chroma deliberately does NOT start here alongside it -- import_kb_seed.sh writes
+# directly into the chroma_data volume via a throwaway container when a seed is being
+# applied, and doing that while the real chroma server already has that same sqlite
+# file open is asking for corruption. chroma starts further down, AFTER the seed
+# decision is made either way.
+docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" up -d postgres &
+PID_POSTGRES_EARLY=$!
 
 OLLAMA_MODEL="${OLLAMA_MODEL:-phi3.5:3.8b}"
 OLLAMA_API=""
@@ -173,25 +193,102 @@ else
   PID_OLLAMA_PULL=$!
 fi
 
+wait "$PID_POSTGRES_EARLY" || die "Postgres failed to start"
+log "Waiting for Postgres to become healthy"
+tries=60
+until [ "$(docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" ps postgres --format '{{.Health}}' 2>/dev/null)" = "healthy" ]; do
+  tries=$((tries - 1))
+  [ "$tries" -le 0 ] && die "Postgres did not become healthy in time"
+  sleep 2
+done
+
+# Schema migrations normally only run when api-gateway's own binary starts (see
+# internal/migrate/migrate.go) -- but that's step 5, AFTER the seed fast-path below. On a
+# genuinely fresh volume (no `documents` table yet at all -- exactly the case the seed
+# exists for), import_kb_seed.sh's own `SELECT count(*) FROM documents` would fail, get
+# treated as "not empty, skip restore", and silently fall through to a full live ingest
+# anyway -- found live: this defeated the seed mechanism for precisely the environment it
+# was built for. Run migrations here instead, via the official golang-migrate image
+# against Postgres directly (no api-gateway build required) -- idempotent, so
+# api-gateway's own migrate.Run() at its step-5 startup is a safe no-op afterward.
+log "Applying schema migrations"
+POSTGRES_CONTAINER=$(docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" ps -q postgres)
+docker run --rm \
+  --network "container:$POSTGRES_CONTAINER" \
+  -v "$REPO_ROOT/infra/postgres/migrations:/migrations:ro" \
+  migrate/migrate:v4.19.1 \
+  -path=/migrations \
+  -database "postgres://${POSTGRES_USER:-techsphere}:${POSTGRES_PASSWORD:-changeme}@localhost:5432/${POSTGRES_DB:-techsphere}?sslmode=disable" \
+  up
+
+# Optional fast-path: a pre-computed snapshot of the given corpus's embeddings + Postgres
+# rows (scripts/export_kb_seed.sh built it once; see that script's docstring for why both
+# halves), so a fresh boot doesn't have to re-run OCR + BGE-M3 over ~107 PDFs from scratch
+# every single time. Silent no-op if kb-seed.tar.gz isn't present, or if `documents` is
+# already non-empty -- falls through to the normal live ingest either way. Writes
+# directly into the chroma_data volume via a throwaway container, so this MUST run
+# before the real chroma server starts (below) and touches the same files.
+./scripts/import_kb_seed.sh
+
+# Whether the seed restore above actually populated `documents` (or it was already
+# non-empty from a prior run) -- step 7 below reads this to decide whether the corpus
+# still needs a live bulk ingest at all. Getting this wrong the other way (running the
+# ~24-minute OCR+BGE-M3 ingest even when the seed already restored everything) is exactly
+# the kind of budget-wasting bug this seed mechanism exists to avoid -- found live: an
+# earlier version of this script ran the ingest step unconditionally after this point.
+DOC_COUNT=$(docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" exec -T postgres psql -tA \
+  --username="${POSTGRES_USER:-techsphere}" --dbname="${POSTGRES_DB:-techsphere}" \
+  -c "SELECT count(*) FROM documents" 2>/dev/null || echo "0")
+DOC_COUNT="${DOC_COUNT:-0}"
+
+log "Starting chroma"
+docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" up -d chroma
+log "Waiting for chroma to answer"
+tries=60
+until curl -sf http://localhost:8000/api/v2/heartbeat >/dev/null 2>&1; do
+  tries=$((tries - 1))
+  [ "$tries" -le 0 ] && die "chroma did not become reachable in time"
+  sleep 2
+done
+
 # vector-store's BGE-M3 embedding model (~2.2GB) used to only start downloading once
 # `docker compose up -d` ran in step 5 -- i.e. AFTER waiting for every other service's
 # build to finish too, not overlapped with anything. Measured live on a cold HuggingFace
 # cache: ~9.5 minutes just for that download, serially eating into the 15-minute G2
-# budget for no reason, the same class of gap as Ollama's pull above. Fixed the same
-# way: build vector-store's image on its own first (it's the dependency, unlike ollama
-# which needs no build at all), start its container immediately once that's done, and
-# let its own startup-time background warmup (`app/main.py`'s `_warm_up_embedder`,
-# already pre-existing) begin overlapping with the OTHER services' still-in-progress
-# `build --parallel` above rather than waiting for them.
-(
-  COMPOSE_BAKE=true docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" build vector-store &&
-  COMPOSE_BAKE=true docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" up -d vector-store
-) &
-PID_VECTOR_STORE_EARLY=$!
+# budget for no reason, the same class of gap as Ollama's pull above.
+#
+# In native mode, vector-store ALSO doesn't run in Docker at all anymore (see
+# docker-compose.yml's top comment) -- found live that BGE-M3 was CPU-only even in
+# native-agent mode purely because it was containerized (Docker Desktop has no Metal
+# passthrough, full stop; FlagEmbedding itself auto-detects MPS correctly once it's
+# actually running on the host). So native mode starts it here as a plain `uv run`
+# process instead of a container, same early-and-parallel treatment as Docker mode's
+# build+up. Chroma itself is NOT part of this move (see docker-compose.yml's top
+# comment -- it does no GPU work, stays in Docker in both modes); CHROMA_HOST=localhost
+# reaches the chroma container above via Docker Desktop's published port.
+VECTOR_STORE_API="http://localhost:8001"
+PID_VECTOR_STORE_EARLY=""
+if [ "$MODE" = "native" ]; then
+  (
+    cd services/vector-store
+    CHROMA_HOST="localhost" \
+    CHROMA_PORT="8000" \
+    uv run uvicorn app.main:app --host 0.0.0.0 --port 8001 \
+      >"$REPO_ROOT/vector-store.native.log" 2>&1 &
+    echo $! > "$REPO_ROOT/vector-store.native.pid"
+  ) &
+  PID_VECTOR_STORE_EARLY=$!
+else
+  (
+    COMPOSE_BAKE=true docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" build vector-store &&
+    COMPOSE_BAKE=true docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" up -d vector-store
+  ) &
+  PID_VECTOR_STORE_EARLY=$!
+fi
 
 wait "$PID_DATASET"  || die "Dataset clone failed"
 wait "$PID_BUILD"    || die "Image build failed"
-wait "$PID_PULL_STOCK_IMAGES" || die "postgres/livekit image pull failed"
+wait "$PID_PULL_STOCK_IMAGES" || die "postgres/livekit/chroma image pull failed"
 if [ -n "$PID_OLLAMA_PULL" ]; then
   wait "$PID_OLLAMA_PULL" || die "Ollama model pull failed"
 fi
@@ -210,14 +307,21 @@ curl -sf "$OLLAMA_API/api/generate" -d "{\"model\":\"$OLLAMA_MODEL\",\"prompt\":
   || warn "Ollama warmup call failed -- the first real call in voice-agent will pay the load cost instead"
 
 # vector-store's own /v1/healthz gates on BGE-M3 actually being warm (not just the
-# container being up) -- wait for it here, now that its download/load has had the whole
-# build phase above to run in the background, instead of the short, easy-to-blow budget
-# step 6 used to give it after everything else was already done.
+# container/process being up) -- wait for it here, now that its download/load has had
+# the whole build phase above to run in the background, instead of the short, easy-to-
+# blow budget step 6 used to give it after everything else was already done.
 log "Waiting for vector-store's embedding model to finish warming up"
 tries=180
-until curl -sf http://localhost:8001/v1/healthz >/dev/null 2>&1; do
+until curl -sf "$VECTOR_STORE_API/v1/healthz" >/dev/null 2>&1; do
   tries=$((tries - 1))
-  [ "$tries" -le 0 ] && { warn "vector-store did not finish warming up in time -- check docker compose logs vector-store"; break; }
+  if [ "$tries" -le 0 ]; then
+    if [ "$MODE" = "native" ]; then
+      warn "vector-store did not finish warming up in time -- check vector-store.native.log"
+    else
+      warn "vector-store did not finish warming up in time -- check docker compose logs vector-store"
+    fi
+    break
+  fi
   sleep 2
 done
 
@@ -225,6 +329,14 @@ done
 # 5. Start the stack
 # ---------------------------------------------------------------------------
 log "Starting services (mode=$MODE)"
+if [ "$MODE" = "native" ]; then
+  # api-gateway always runs in Docker (both modes), but vector-store is now native-only
+  # in this mode -- a container can't reach the host via "localhost" (that's the
+  # container itself), it needs Docker Desktop for Mac's special DNS name instead. This
+  # overrides docker-compose.yml's VECTOR_STORE_URL interpolation (default is the
+  # compose-internal hostname, correct for full-Docker mode).
+  export VECTOR_STORE_URL="http://host.docker.internal:8001"
+fi
 COMPOSE_BAKE=true docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" up -d
 
 if [ "$MODE" = "native" ]; then
@@ -283,14 +395,25 @@ wait_http "http://localhost:8080/healthz" "api-gateway" || true
 # enough to queue deep enough to hit api-gateway's 5-minute ingest timeout (measured:
 # concurrency=8 timed out 5 of 8 requests waiting for the lock, though nothing was
 # actually broken -- they just never got their turn in time).
+#
+# Skipped entirely if DOC_COUNT (computed right after the seed fast-path above) shows the
+# corpus is already there -- either restored from kb-seed.tar.gz just now, or left over
+# from a prior run against the same Postgres/Chroma volumes. Running the full ~24-minute
+# OCR+BGE-M3 pass again in that case would silently burn most of the G2 budget for
+# nothing -- found live, this is exactly the bug the seed fast-path was supposed to
+# prevent but didn't, because this step never checked its result.
 # ---------------------------------------------------------------------------
-log "Loading the knowledge base corpus (blocking -- see this step's comment for why)"
-DATASET_PATH="$DATASET_DIR" uv run scripts/bulk_ingest_corpus.py \
-  --api-url "http://localhost:${PORT:-8080}" \
-  --concurrency "${BULK_INGEST_CONCURRENCY:-3}" \
-  2>&1 | tee "$REPO_ROOT/bulk_ingest.log"
-BULK_INGEST_STATUS="${PIPESTATUS[0]}"
-[ "$BULK_INGEST_STATUS" -eq 0 ] || die "Knowledge base bulk-load failed (see bulk_ingest.log) -- the system is not usable without it, not a soft failure"
+if [ "$DOC_COUNT" -gt 0 ] 2>/dev/null; then
+  log "Knowledge base already populated ($DOC_COUNT documents) -- skipping bulk ingest"
+else
+  log "Loading the knowledge base corpus (blocking -- see this step's comment for why)"
+  DATASET_PATH="$DATASET_DIR" uv run scripts/bulk_ingest_corpus.py \
+    --api-url "http://localhost:${PORT:-8080}" \
+    --concurrency "${BULK_INGEST_CONCURRENCY:-3}" \
+    2>&1 | tee "$REPO_ROOT/bulk_ingest.log"
+  BULK_INGEST_STATUS="${PIPESTATUS[0]}"
+  [ "$BULK_INGEST_STATUS" -eq 0 ] || die "Knowledge base bulk-load failed (see bulk_ingest.log) -- the system is not usable without it, not a soft failure"
+fi
 
 # ---------------------------------------------------------------------------
 # 8. Done
@@ -308,3 +431,7 @@ Record the elapsed time above in the README's "levantamiento" section (G2 is tim
 against exactly this command). The knowledge base corpus is fully loaded and searchable
 -- this includes that time, not just the process being up.
 EOF
+
+if [ "$MODE" = "native" ]; then
+  warn "vector-store and voice-agent are running natively, not in Docker -- to stop them: kill \$(cat vector-store.native.pid) \$(cat voice-agent.native.pid)"
+fi

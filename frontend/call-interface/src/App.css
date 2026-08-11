@@ -70,3 +70,28 @@ h1 {
   margin-bottom: 20px;
   font-size: 16px;
 }
+
+.precall-form {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  max-width: 360px;
+}
+
+.precall-hint {
+  color: var(--text-muted);
+  font-size: 15px;
+  margin: 0;
+}
+
+.precall-form input {
+  width: 100%;
+  font-size: 18px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}

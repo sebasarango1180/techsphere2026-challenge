@@ -1,13 +1,18 @@
-"""The six-signal running clinical picture for a call, built up incrementally as Track B
-classifies each turn -- pain_nrs/fever_c/mobility/wound/appetite/sleep, the exact
-taxonomy the reference dataset's trajectories use (docs/dataset-eda.md §3, §7). This is
-what makes "keep all the relevant patient context for the agent at any point in time" a
-real property of the system rather than a turn-by-turn amnesia: the agent injects its
-own current snapshot back into context on every subsequent turn (app/main.py's
-on_user_turn_completed) so it doesn't re-ask something it already knows, and the
-snapshot is upserted to Postgres after every turn (app/db.py's upsert_clinical_snapshot),
-not just once at call end, so it survives a reconnect (plan §2.10) or an agent process
-restart mid-call.
+"""The six-signal clinical picture for a call -- pain_nrs/fever_c/mobility/wound/
+appetite/sleep, the exact taxonomy the reference dataset's trajectories use
+(docs/dataset-eda.md §3, §7).
+
+Extracted ONCE, at call end, from the full transcript (app/main.py's summarize_call,
+via app/prompts.py's FINAL_CLASSIFICATION_PROMPT_ES) -- NOT incrementally per turn
+anymore. That per-turn version existed earlier; it was reworked after finding, live,
+that running that classification concurrently with the conversational LLM call on every
+single turn contended for the same local Ollama instance and caused real timeouts and
+dropped connections during live calls, and because a whole-transcript extraction is
+more accurate than any single turn taken alone (a clarification given three turns later
+can correct an earlier one). Conversation FLOW (which of the six topics to ask about
+next) no longer depends on this snapshot being populated live -- see
+`QUESTION_ORDER`/`topic_hint` below, driven by a simple turn counter in
+`PostSurgicalAgent` instead.
 
 Values the model returns are validated against the same enum vocabulary the DB columns
 enforce (infra/postgres/migrations/0002_patient_context.up.sql) before being kept --
@@ -33,6 +38,31 @@ _LABELS_ES = {
     "appetite": "apetito",
     "sleep": "sueno",
 }
+
+# Fixed order from docs/dataset-eda.md §2: every real conversation in the reference
+# dataset asks these six in exactly this order, always -- "std=0.0 on turns-per-case",
+# not a loose pattern the model happens to follow. Used to steer the LLM's NEXT question
+# (see next_missing_topic below) rather than leaving ordering to its own judgment.
+QUESTION_ORDER = ("pain_nrs", "fever_c", "mobility", "wound", "appetite", "sleep")
+
+_TOPIC_HINTS_ES = {
+    "pain_nrs": "el dolor, en una escala de 0 a 10",
+    "fever_c": "si ha tenido fiebre o escalofrios",
+    "mobility": "como se ha podido mover o caminar",
+    "wound": "como se ve y se siente la herida",
+    "appetite": "el apetito",
+    "sleep": "como ha dormido",
+}
+
+
+def topic_hint(index: int) -> str | None:
+    """Natural-language hint (Spanish) for QUESTION_ORDER[index], or None once index is
+    past the last topic -- the turn-counter-driven replacement for the old
+    snapshot-driven next_missing_topic() (see module docstring). A plain index lookup,
+    deliberately not dependent on any live extraction succeeding."""
+    if 0 <= index < len(QUESTION_ORDER):
+        return _TOPIC_HINTS_ES[QUESTION_ORDER[index]]
+    return None
 
 
 @dataclass
@@ -69,13 +99,34 @@ class ClinicalSnapshot:
     def _merge_enum(self, field: str, value: object, valid: set[str]) -> None:
         if value is None:
             return
-        if value in valid:
-            setattr(self, field, value)
+        # Found live: the model reliably returns grammatically-natural Spanish with
+        # spaces ("muy disminuido") instead of the enum's underscore form
+        # ("muy_disminuido") -- an exact-match check was silently dropping otherwise-
+        # correct extractions. Normalize before validating; store the canonical form.
+        normalized = value.strip().lower().replace(" ", "_") if isinstance(value, str) else value
+        if normalized in valid:
+            setattr(self, field, normalized)
         else:
             logger.warning("dropping out-of-vocabulary %s from model: %r", field, value)
 
     def has_any(self) -> bool:
         return any(getattr(self, f.name) is not None for f in fields(self))
+
+    def missing_fields(self) -> list[str]:
+        """Every signal still null, in fixed order -- the fallback for call_summaries'
+        `missing_info` when the model's own end-of-call response doesn't report any
+        (app/main.py's summarize_call)."""
+        return [_LABELS_ES[f] for f in QUESTION_ORDER if getattr(self, f) is None]
+
+    def next_missing_topic(self) -> str | None:
+        """Which of the six signals is still null, in fixed order -- None once all six
+        are known. NOT used to drive conversation flow anymore (see module docstring,
+        `topic_hint`); useful at call end as a cross-check against the model's own
+        self-reported "missing_info" list."""
+        for field_name in QUESTION_ORDER:
+            if getattr(self, field_name) is None:
+                return _TOPIC_HINTS_ES[field_name]
+        return None
 
     def render_es(self) -> str:
         parts = []

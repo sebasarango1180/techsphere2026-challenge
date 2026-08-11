@@ -22,13 +22,22 @@ import (
 
 var errFileRequired = errors.New("file is required")
 
-// ListDocuments implements GET /api/v1/documents.
+// ListDocuments implements GET /api/v1/documents. Excludes soft-deleted documents by
+// default -- a deleted document has no real chunks left in vector-store (DeleteDocument
+// purges them synchronously, plan §2.4/G5), so leaving it in the default list just
+// clutters the admin console with dead rows. Pass ?status=all to see everything
+// (deleted included), e.g. for debugging.
 func (s *Server) ListDocuments(c *gin.Context) {
-	rows, err := s.DB.Query(c.Request.Context(), `
+	query := `
 		SELECT id, title, category, status, current_version
 		FROM documents
-		ORDER BY created_at DESC
-	`)
+	`
+	if c.Query("status") != "all" {
+		query += ` WHERE status != 'deleted'`
+	}
+	query += ` ORDER BY created_at DESC`
+
+	rows, err := s.DB.Query(c.Request.Context(), query)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

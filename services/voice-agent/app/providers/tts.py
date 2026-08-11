@@ -21,6 +21,7 @@ voice id within that language is the unverified part.
 """
 
 import asyncio
+import logging
 import queue
 from functools import lru_cache
 
@@ -30,17 +31,37 @@ from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
 
 from app.config import settings
 
+logger = logging.getLogger(__name__)
+
 SAMPLE_RATE = 24000
 NUM_CHANNELS = 1
 
 _SENTINEL = object()
 
 
+def _pick_device() -> str:
+    """Kokoro's own KPipeline.__init__ auto-selects a device with `'cuda' if
+    torch.cuda.is_available() else 'cpu'` -- it has no concept of MPS at all, so on
+    macOS (this service's native-mode host, specifically so Metal is available -- plan
+    §2.5) it silently ran on CPU even when running natively for exactly that reason.
+    Found by reading KPipeline's source, not assumed; verified `torch.backends.mps.
+    is_available()` is True on this host. Override its default explicitly rather than
+    relying on device=None.
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 @lru_cache(maxsize=1)
 def _get_pipeline():
     from kokoro import KPipeline
 
-    return KPipeline(lang_code=settings.tts_lang_code)
+    device = _pick_device()
+    logger.info("Kokoro TTS pipeline using device=%s", device)
+    return KPipeline(lang_code=settings.tts_lang_code, device=device)
 
 
 def warm_up() -> None:

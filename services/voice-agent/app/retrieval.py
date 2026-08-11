@@ -30,7 +30,11 @@ async def search(query: str, top_k: int = 8, category_hint: str | None = None) -
     "assignment" in this design -- every call searches the same current, versioned
     corpus.
     """
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    # 10s wasn't enough headroom under real load -- found live, a search call timed out
+    # mid-call while vector-store's BGE-M3 and this process's own Kokoro TTS pipeline
+    # were both competing for the same Metal GPU (see app/main.py's
+    # on_user_turn_completed for the graceful-degradation side of this same finding).
+    async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.post(
             f"{settings.vector_store_url}/v1/search",
             json={"query": query, "top_k": top_k, "category_hint": category_hint},

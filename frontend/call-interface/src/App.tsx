@@ -34,11 +34,26 @@ export default function App() {
   const [attempt, setAttempt] = useState(0)
   const [error, setError] = useState<string | null>(null)
 
+  // Optional pre-call context -- lets the agent address the patient by name and be
+  // aware of their age/known conditions without needing a registered patient record
+  // (services/api-gateway's CreateCall only applies these for an anonymous call, which
+  // is all this app ever sends). Entirely optional: an empty name still starts a call
+  // with no context, same as before this existed.
+  const [patientName, setPatientName] = useState('')
+  const [age, setAge] = useState('')
+  const [conditions, setConditions] = useState('')
+
   async function startCall() {
     setPhase('connecting')
     setError(null)
     try {
-      const created = await api.createCall()
+      const created = await api.createCall({
+        patient_name: patientName.trim() || undefined,
+        age: age.trim() ? Number(age) : undefined,
+        comorbidities: conditions.trim()
+          ? conditions.split(',').map((c) => c.trim()).filter(Boolean)
+          : undefined,
+      })
       setCall(created)
       setAttempt((a) => a + 1)
       setPhase('connected')
@@ -78,9 +93,41 @@ export default function App() {
           Presiona el boton para iniciar tu llamada de voz con el asistente.
         </p>
         {error && <div className="error-banner">{error}</div>}
-        <button type="button" className="big-button" onClick={startCall} disabled={phase === 'connecting'}>
-          {phase === 'connecting' ? 'Conectando...' : 'Iniciar llamada'}
-        </button>
+        <form
+          className="precall-form"
+          onSubmit={(e) => {
+            e.preventDefault()
+            startCall()
+          }}
+        >
+          <p className="precall-hint">Opcional: cuentanos un poco sobre ti antes de empezar.</p>
+          <input
+            type="text"
+            placeholder="Tu nombre"
+            value={patientName}
+            onChange={(e) => setPatientName(e.target.value)}
+            disabled={phase === 'connecting'}
+          />
+          <input
+            type="number"
+            min={0}
+            max={120}
+            placeholder="Edad"
+            value={age}
+            onChange={(e) => setAge(e.target.value)}
+            disabled={phase === 'connecting'}
+          />
+          <input
+            type="text"
+            placeholder="Condiciones preexistentes (ej. diabetes, hipertension)"
+            value={conditions}
+            onChange={(e) => setConditions(e.target.value)}
+            disabled={phase === 'connecting'}
+          />
+          <button type="submit" className="big-button" disabled={phase === 'connecting'}>
+            {phase === 'connecting' ? 'Conectando...' : 'Iniciar llamada'}
+          </button>
+        </form>
       </div>
     )
   }

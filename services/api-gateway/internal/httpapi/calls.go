@@ -24,11 +24,13 @@ const tokenTTL = time.Hour
 // (specs/implementation-plan.md §2.1/§2.10). Field names are what voice-agent's
 // _extract_call_context parses, so keep the two in sync.
 type roomMetadata struct {
-	PatientID   string `json:"patient_id,omitempty"`
-	PatientName string `json:"patient_name,omitempty"`
-	Category    string `json:"category,omitempty"`
-	Procedure   string `json:"procedure,omitempty"`
-	PostopDay   *int   `json:"postop_day,omitempty"`
+	PatientID     string   `json:"patient_id,omitempty"`
+	PatientName   string   `json:"patient_name,omitempty"`
+	Category      string   `json:"category,omitempty"`
+	Procedure     string   `json:"procedure,omitempty"`
+	PostopDay     *int     `json:"postop_day,omitempty"`
+	Age           *int     `json:"age,omitempty"`
+	Comorbidities []string `json:"comorbidities,omitempty"`
 }
 
 // CreateCall implements POST /api/v1/calls: looks up the patient (if given), creates
@@ -66,6 +68,13 @@ func (s *Server) CreateCall(c *gin.Context) {
 		if procedure != nil {
 			meta.Procedure = *procedure
 		}
+	} else {
+		// Anonymous call, but the caller may still have typed in some context directly
+		// (call-interface's pre-call form) -- no DB row backs this, so it's taken as
+		// given rather than looked up.
+		meta.PatientName = req.PatientName
+		meta.Age = req.Age
+		meta.Comorbidities = req.Comorbidities
 	}
 
 	metadataJSON, err := json.Marshal(meta)
@@ -178,15 +187,70 @@ func fetchCallSummary(ctx context.Context, db *pgxpool.Pool, callID string) (*mo
 	var summary models.CallSummary
 	err := db.QueryRow(ctx, `
 		SELECT procedure, symptoms_reported, decision, "references", next_steps,
-		       pain_nrs, fever_c, mobility, wound, appetite, sleep, updated_at
+		       pain_nrs, fever_c, mobility, wound, appetite, sleep, updated_at,
+		       final_triage, triage_rationale, triage_confidence,
+		       COALESCE(missing_info, '[]'::jsonb),
+		       pathology_assessment, COALESCE(pathology_evidence, '[]'::jsonb)
 		FROM call_summaries WHERE call_id = $1
 	`, callID).Scan(
 		&summary.Procedure, &summary.SymptomsReported, &summary.Decision, &summary.References, &summary.NextSteps,
 		&summary.PainNRS, &summary.FeverC, &summary.Mobility, &summary.Wound, &summary.Appetite, &summary.Sleep,
 		&summary.UpdatedAt,
+		&summary.FinalTriage, &summary.TriageRationale, &summary.TriageConfidence,
+		&summary.MissingInfo, &summary.PathologyAssessment, &summary.PathologyEvidence,
 	)
 	if err != nil {
 		return nil, err
 	}
 	return &summary, nil
+}
+
+// ListCalls implements GET /api/v1/calls?status= -- one row per call, joined with its
+// patient identity and current call_summaries snapshot (six signals, final triage,
+// pathology validation), so the admin console's "Calls" tab can render everything in one
+// request rather than paging through GetCallSummary per call.
+func (s *Server) ListCalls(c *gin.Context) {
+	ctx := c.Request.Context()
+	status := c.Query("status")
+
+	const selectClause = `
+		SELECT c.id, c.patient_id, p.name, p.category, c.postop_day, c.status, c.started_at, c.ended_at,
+		       cs.pain_nrs, cs.fever_c, cs.mobility, cs.wound, cs.appetite, cs.sleep,
+		       cs.final_triage, cs.triage_rationale, cs.triage_confidence,
+		       COALESCE(cs.missing_info, '[]'::jsonb),
+		       cs.pathology_assessment, COALESCE(cs.pathology_evidence, '[]'::jsonb)
+		FROM calls c
+		LEFT JOIN patients p ON p.id = c.patient_id
+		LEFT JOIN call_summaries cs ON cs.call_id = c.id
+	`
+
+	var rows pgx.Rows
+	var err error
+	if status != "" {
+		rows, err = s.DB.Query(ctx, selectClause+" WHERE c.status = $1 ORDER BY c.started_at DESC", status)
+	} else {
+		rows, err = s.DB.Query(ctx, selectClause+" ORDER BY c.started_at DESC")
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	out := []models.CallListItem{}
+	for rows.Next() {
+		var item models.CallListItem
+		if err := rows.Scan(
+			&item.ID, &item.PatientID, &item.PatientName, &item.Category, &item.PostopDay,
+			&item.Status, &item.StartedAt, &item.EndedAt,
+			&item.PainNRS, &item.FeverC, &item.Mobility, &item.Wound, &item.Appetite, &item.Sleep,
+			&item.FinalTriage, &item.TriageRationale, &item.TriageConfidence,
+			&item.MissingInfo, &item.PathologyAssessment, &item.PathologyEvidence,
+		); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		out = append(out, item)
+	}
+	c.JSON(http.StatusOK, out)
 }

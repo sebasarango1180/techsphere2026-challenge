@@ -21,9 +21,12 @@ class Settings(BaseSettings):
 
     # TTS
     tts_model: str = "hexgrad/Kokoro-82M"
-    tts_voice: str = "ef_dora"  # TODO(workstream C): confirm against hexgrad/Kokoro-82M's
-    # VOICES.md once the weights are downloaded -- lang_code "e" (Spanish) per misaki's
-    # language table, but the exact voice id here is not yet verified against the repo.
+    # Verified against the real repo (huggingface.co/hexgrad/Kokoro-82M/tree/main/voices):
+    # the only Spanish ("e" lang code) voices are ef_dora (female), em_alex/em_santa
+    # (male). This default was always correct -- .env had TTS_VOICE=es (a plausible
+    # looking but wrong guess), which 404s fetching voices/es.pt and silently kills
+    # every TTS call. Found live: a call with no greeting and no replies at all.
+    tts_voice: str = "ef_dora"
     tts_lang_code: str = "e"
 
     # Knowledge
