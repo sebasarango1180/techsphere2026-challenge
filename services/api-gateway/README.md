@@ -90,6 +90,7 @@ What's still open, in priority order for G2/G3/G4/G5:
 ```sh
 export DATABASE_URL=postgres://techsphere:changeme@localhost:5432/techsphere?sslmode=disable
 export MIGRATIONS_PATH=../../infra/postgres/migrations
+export OPENAPI_PATH=../../docs/openapi/api-gateway.yaml
 export LIVEKIT_API_KEY=devkey
 export LIVEKIT_API_SECRET=changeme_min_32_chars_______________
 go run ./cmd/api-gateway

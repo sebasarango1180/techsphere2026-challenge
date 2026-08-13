@@ -372,7 +372,7 @@ if [ "$MODE" = "native" ]; then
     VECTOR_STORE_URL="http://localhost:8001" \
     LIVEKIT_URL="ws://localhost:7880" \
     DATABASE_URL="postgres://${POSTGRES_USER:-techsphere}:${POSTGRES_PASSWORD:-changeme}@localhost:5432/${POSTGRES_DB:-techsphere}?sslmode=disable" \
-    uv run python -m app.main >"$REPO_ROOT/voice-agent.native.log" 2>&1 &
+    uv run python -m app.main start >"$REPO_ROOT/voice-agent.native.log" 2>&1 &
     echo $! > "$REPO_ROOT/voice-agent.native.pid"
   )
   log "voice-agent running natively (PID $(cat "$REPO_ROOT/voice-agent.native.pid")); logs at voice-agent.native.log"

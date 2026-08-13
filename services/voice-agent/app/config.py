@@ -14,8 +14,10 @@ class Settings(BaseSettings):
     ollama_host: str = "http://ollama:11434"
     ollama_model: str = "phi3.5:3.8b"
 
-    # STT (plan §2.2 -- dual mode)
-    stt_mode: str = "groq"  # "groq" | "local"
+    # STT (plan §2.2 -- dual mode). Local (faster-whisper) is the default -- no external
+    # API key required, keeps the stack fully self-contained; groq is opt-in for anyone
+    # who wants Whisper Large V3's accuracy/latency over the network instead.
+    stt_mode: str = "local"  # "groq" | "local"
     groq_api_key: str = ""
     local_whisper_model: str = "small"  # faster-whisper model size
 

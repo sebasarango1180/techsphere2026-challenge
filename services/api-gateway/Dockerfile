@@ -24,6 +24,7 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates wget
 COPY --from=build /out/api-gateway /usr/local/bin/api-gateway
 COPY infra/postgres/migrations /app/migrations
+COPY docs/openapi/api-gateway.yaml /app/openapi/api-gateway.yaml
 
 EXPOSE 8080
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=10 \

@@ -145,6 +145,17 @@ class PostSurgicalAgent(Agent):
         # el documento" without going back to retrieving on every single turn.
         self.pending_citation_chunk_ids: list[str] = []
 
+        # Same pattern as pending_citation_chunk_ids above, for the conversational LLM's
+        # own token usage -- entrypoint()'s session.on("metrics_collected") handler sets
+        # this from the LLMMetrics event (prompt_tokens/completion_tokens), and
+        # conversation_item_added reads+clears it for whichever agent turn comes next.
+        # Safe to pair this way because the conversational LLM (app/providers/llm.py) is
+        # the only livekit-agents LLM plugin instance in this process -- the
+        # classification/pathology/narrative calls in summarize_call are raw httpx calls
+        # against Ollama directly, not through livekit's LLM interface, so they never
+        # emit a "metrics_collected" event and can't cross-contaminate this.
+        self.pending_llm_tokens: tuple[int, int] | None = None
+
     async def on_enter(self) -> None:
         """Runs once, right when the agent joins the call (livekit-agents' official
         hook) -- this is where the mandatory greeting lives. Spoken verbatim via
@@ -462,6 +473,13 @@ async def summarize_call(session: AgentSession, agent: PostSurgicalAgent) -> Non
     # only chunk_ids that were actually offered in kb_chunks are kept, so a hallucinated
     # id can't produce a fabricated citation.
     chunks_by_id = {c.chunk_id: c for c in kb_chunks}
+    if kb_chunks and not pathology.get("pathology_assessment"):
+        # KB context existed but the model's JSON came back without the field the prompt
+        # demands (schema drift -- see PATHOLOGY_VALIDATION_PROMPT_ES's docstring; this
+        # doesn't raise since the JSON itself is syntactically valid, just missing the
+        # key) -- log it so this degrades visibly instead of as a silent NULL in
+        # call_summaries.pathology_assessment.
+        logger.warning("call_id=%s pathology validation returned no pathology_assessment despite %d kb_chunks -- raw=%r", call_id, len(kb_chunks), pathology)
     pathology_citations = pathology.get("pathology_citations")
     if not isinstance(pathology_citations, list):
         pathology_citations = []
@@ -599,7 +617,9 @@ async def _validate_pathology(
         patient_context_parts.append(f"Edad: {call_ctx.age} anos")
     if call_ctx.comorbidities:
         patient_context_parts.append(f"Condiciones preexistentes: {', '.join(call_ctx.comorbidities)}")
-    try:
+    user_content = ". ".join(patient_context_parts)
+
+    async def _call_once(reminder: str = "") -> dict:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{settings.ollama_host}/api/chat",
@@ -608,7 +628,7 @@ async def _validate_pathology(
                     "messages": [
                         {"role": "system", "content": PATHOLOGY_VALIDATION_PROMPT_ES},
                         {"role": "system", "content": kb_context},
-                        {"role": "user", "content": ". ".join(patient_context_parts)},
+                        {"role": "user", "content": user_content + reminder},
                     ],
                     "format": "json",
                     "stream": False,
@@ -616,6 +636,22 @@ async def _validate_pathology(
             )
             resp.raise_for_status()
             return json.loads(resp.json()["message"]["content"])
+
+    # Retried once on schema drift (missing "pathology_assessment" despite a
+    # syntactically-valid JSON reply -- found live: phi3.5:3.8b occasionally omits it,
+    # `format: "json"` only enforces valid syntax, not our schema) before giving up --
+    # cheap insurance against the exact silent-empty-field failure this was found from,
+    # since the model is non-deterministic enough that a second attempt usually recovers.
+    try:
+        result = await _call_once()
+        if not result.get("pathology_assessment"):
+            logger.warning("call_id=%s pathology validation missing pathology_assessment on first attempt, retrying -- raw=%r", call_id, result)
+            result = await _call_once(
+                "\n\nRECORDATORIO: tu respuesta anterior no incluyo la clave \"pathology_assessment\" "
+                "requerida. Responde SOLO con el JSON exacto {\"pathology_assessment\": \"...\", "
+                "\"pathology_citations\": [...]}, sin omitir ninguna clave."
+            )
+        return result
     except Exception:
         logger.exception("pathology validation failed for call_id=%s", call_id)
         return {}
@@ -774,6 +810,19 @@ async def entrypoint(ctx: JobContext) -> None:
         agent._background_tasks.add(task)
         task.add_done_callback(agent._background_tasks.discard)
 
+    @session.on("metrics_collected")
+    def _on_metrics(event: agents.MetricsCollectedEvent) -> None:
+        # Captures the conversational LLM's own prompt/completion token counts (the
+        # README's required "tokens per turn/call" metrics -- specs/implementation-plan.md
+        # §0) -- these were never wired up before, so MetricsSummary's tokens_in/out were
+        # always 0 despite the SQL query being correct. Only llm_metrics events matter
+        # here; stt/tts/vad metrics_collected events fire too but carry no token counts we
+        # need (STTMetrics.input_tokens is audio-token billing, not what the rubric asks
+        # for). See PostSurgicalAgent.pending_llm_tokens' docstring for why pairing this
+        # with the NEXT agent conversation_item_added is safe.
+        if getattr(event.metrics, "type", None) == "llm_metrics":
+            agent.pending_llm_tokens = (event.metrics.prompt_tokens, event.metrics.completion_tokens)
+
     @session.on("close")
     def _on_session_close(event: agents.CloseEvent) -> None:
         # AgentSession closes itself (RoomInputOptions.close_on_disconnect defaults to
@@ -805,6 +854,10 @@ async def entrypoint(ctx: JobContext) -> None:
         if role == "agent" and agent.pending_citation_chunk_ids:
             retrieved_chunk_ids = agent.pending_citation_chunk_ids
             agent.pending_citation_chunk_ids = []
+        tokens_in = tokens_out = None
+        if role == "agent" and agent.pending_llm_tokens is not None:
+            tokens_in, tokens_out = agent.pending_llm_tokens
+            agent.pending_llm_tokens = None
         asyncio.create_task(
             db.insert_turn(
                 call_id=call_ctx.call_id,
@@ -814,6 +867,8 @@ async def entrypoint(ctx: JobContext) -> None:
                 retrieval_ms=_ms(metrics.get("on_user_turn_completed_delay")),
                 llm_ms=_ms(metrics.get("llm_node_ttft")),
                 tts_ms=_ms(metrics.get("tts_node_ttfb")),
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
                 retrieved_chunk_ids=retrieved_chunk_ids,
             )
         )

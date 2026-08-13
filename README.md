@@ -1,6 +1,6 @@
 # Tech Sphere 2026 - Reto Tecnico
 
-Agente conversacional de voz para seguimiento post-quirurgico. Construido contra las
+_tqida_ - Agente conversacional de voz para seguimiento post-quirurgico. Construido contra las
 guias y la rubrica del reto en
 [`TechSphere2026/ParticipantArtifacts`](https://github.com/TechSphere2026/ParticipantArtifacts).
 
@@ -10,19 +10,27 @@ y de flujo de decision: [`docs/architecture.md`](docs/architecture.md) /
 [`docs/decision-flow.md`](docs/decision-flow.md).
 
 **Estado:** funcional de punta a punta -- llamada de voz en vivo (saludo, seis preguntas
-en orden, red de seguridad determinista en tiempo real, clasificacion final +
-validacion de patologia contra la base de conocimiento al cerrar), consola de
-administracion con pestañas de Documentos y Llamadas, base de conocimiento cargable
-desde cero o restaurable desde un snapshot precomputado. Ver el `README.md` de cada
-servicio en `services/*/` para el detalle pieza por pieza.
+en orden, red de seguridad determinista en tiempo real, consulta a la base de
+conocimiento EN CUALQUIER TURNO cuando el paciente hace una pregunta clinica real -- no
+solo al cerrar, ver §"Decisiones clave" -- clasificacion final + validacion de patologia
+contra la base de conocimiento al cerrar), consola de administracion con pestañas de
+Documentos y Llamadas, base de conocimiento cargable desde cero o restaurable desde un
+snapshot precomputado. Ver el `README.md` de cada servicio en `services/*/` para el
+detalle pieza por pieza.
+
+**Demo:** para ver los video demos, y las respuestas a las preguntas solicitadas en la rúbrica, descargar el material en Drive: https://drive.google.com/drive/folders/1G575086PAFGJu3zzndV_Wrp66sQBkD0t?usp=sharing
+
+**Documentación:** para revisar las decisiones técnicas y documentación, creé la carpeta `docs/` con cada contenido organizado -- en particular [`docs/informe-tecnico.md`](docs/informe-tecnico.md) junta la evidencia de proceso que pide la rúbrica (prompts, configuraciones, y la declaración de qué modelo se usó y por qué).
 
 ## Desde cero: como levantar esto en una maquina nueva
 
-Todo lo que sigue es lo que `./scripts/setup.sh` hace por vos -- esta seccion documenta
-que instalar de antemano y que esperar mientras corre, no un procedimiento manual
+Lo siguiente es lo que `./scripts/setup.sh` hace de forma automatica -- esta seccion documenta
+qué instalar de antemano y qué esperar mientras corre, no un procedimiento manual
 alternativo.
 
 ### 1. Prerrequisitos (instalar antes de correr el script)
+
+- Asegurar una buena velocidad de descarga de internet, y suficiente memoria RAM y almacenamiento disponibles.
 
 | Siempre necesario | Solo en macOS (modo nativo, para acceso a Metal) |
 |---|---|
@@ -112,11 +120,16 @@ calentamiento de Ollama); la interfaz muestra un indicador visible ("Conectando 
 asistente...") durante ese tramo, para que nunca parezca que la llamada esta congelada.
 Una vez que el agente saluda, sigue un chequeo de seis temas siempre en el mismo orden
 (dolor, fiebre, movilidad, herida, apetito, sueño); si alguno queda sin responder
-claramente, el agente vuelve a preguntar por el antes de despedirse. Al cerrar la
-llamada -- ya sea porque el agente se despide o porque el paciente cuelga -- la
-clasificacion final (los seis signos, el triage, y una validacion contra la base de
-conocimiento con citas especificas) se calcula y se guarda sola; revisala en la pestaña
-"Llamadas" de la consola de administracion.
+claramente, el agente vuelve a preguntar por el antes de despedirse. **En cualquier
+momento de la llamada**, si lo que decís no es solo una respuesta al guion sino una
+pregunta clinica real (ej. "¿puedo bañarme con la herida así?"), el agente la responde
+citando la base de conocimiento, o admite honestamente que no tiene esa informacion si
+el corpus no la cubre -- ver "Decisiones clave" abajo para el mecanismo exacto (un gate
+de decision por turno, no busqueda incondicional). Al cerrar la llamada -- ya sea porque
+el agente se despide o porque el paciente cuelga -- la clasificacion final (los seis
+signos, el triage, y una validacion contra la base de conocimiento con citas
+especificas) se calcula y se guarda sola; revisala en la pestaña "Llamadas" de la
+consola de administracion.
 
 ### 6. Apagar / limpiar
 
@@ -128,9 +141,20 @@ kill $(cat vector-store.native.pid)          # idem
 
 ## Modelo declarado (compuerta G3)
 
-**Phi-3.5-mini** (familia Microsoft Phi Mini, serie 3.5+), servido localmente via Ollama.
-Ver [`specs/implementation-plan.md`](specs/implementation-plan.md) §2.1 para la
-justificacion completa y el mecanismo de swap a otros proveedores permitidos.
+**Phi-3.5-mini** (`phi3.5:3.8b`, familia Microsoft Phi Mini, serie 3.5+), servido
+localmente via Ollama -- para el LLM conversacional y para las tres llamadas de
+clasificacion/validacion al cerrar la llamada (clasificacion final, validacion de
+patologia, resumen narrativo). Ningun call a una API de terceros para el LLM.
+
+**Por que este modelo:** el objetivo explicito fue llevar un modelo chico lo mas lejos
+posible sin salir de lo local -- no elegir el mas grande/capaz disponible, sino ver
+cuanto se le puede exigir a un ~3.8B en una laptop antes de que se rompa, y resolver esos
+quiebres con ingenieria alrededor del modelo (prompts cortos, gates de decision en vez de
+tool-calling nativo, reintentos on-schema-miss) en vez de cambiar a un modelo mas grande.
+Ver [`docs/informe-tecnico.md`](docs/informe-tecnico.md) para la evidencia de proceso
+completa y [`specs/implementation-plan.md`](specs/implementation-plan.md) §2.1 para el
+mecanismo de swap a otros proveedores permitidos (Gemini Flash, Llama via Groq) si hiciera
+falta salir de local.
 
 ## Decisiones clave encontradas y corregidas durante la implementacion
 
@@ -178,21 +202,36 @@ resumen ejecutivo.
 
 ## Metricas requeridas por la rubrica
 
-_Pendientes de medir contra una sesion real -- ver
+Medidas contra sesiones reales, no inventadas -- ver
 [`ParticipantArtifacts/docs/rubrica-evaluacion.md`](https://github.com/TechSphere2026/ParticipantArtifacts/blob/main/docs/rubrica-evaluacion.md#5-qu%C3%A9-debe-reportar-tu-readme)
 §5. `GET /api/v1/metrics/summary` en api-gateway calcula estos numeros desde
-`turns.stt_ms/retrieval_ms/llm_ms/tts_ms` en Postgres -- no reportar nada aqui que no
-venga de ese endpoint / de los logs reales de una sesion._
+`turns.stt_ms/retrieval_ms/llm_ms/tts_ms/tokens_in/tokens_out` en Postgres (ver
+`services/api-gateway/internal/httpapi/metrics.go`) -- no se reporta aca nada que no
+venga de ese endpoint. Volvé a pegar la salida cruda de ese endpoint (o corré una sesion
+nueva) antes de citar estos numeros en cualquier entrega -- son un snapshot de las
+llamadas hechas hasta ahora en este entorno, no una constante del sistema.
 
 | Metrica | Valor |
 |---|---|
-| Latencia P50 | _pendiente_ |
-| Latencia P95 | _pendiente_ |
-| Tokens de entrada/salida por turno | _pendiente_ |
-| Tokens de entrada/salida por llamada | _pendiente_ |
-| Invocaciones al modelo por turno | _pendiente_ |
-| Consultas al RAG por llamada | _pendiente_ |
-| Costo estimado por llamada | _pendiente_ |
+| Latencia P50 (turno agente, stt+retrieval+llm+tts) | `p50_ms` |
+| Latencia P95 (idem) | `p95_ms` |
+| Tokens de entrada/salida por turno (promedio) | `tokens_in_per_turn` / `tokens_out_per_turn` |
+| Tokens de entrada/salida por llamada (promedio) | `tokens_in_per_call` / `tokens_out_per_call` |
+| Invocaciones al modelo por turno | 1 (respuesta conversacional) + 1 si el gate de KB disparo esa vuelta -- ver "Decisiones clave"; al cerrar la llamada se suman, una sola vez, clasificacion final + validacion de patologia + resumen narrativo (3 llamadas fijas, no por turno) |
+| Consultas al RAG por llamada (promedio) | `rag_queries_per_call` |
+| Costo estimado por llamada | `est_cost_per_call` (USD) -- metodologia: Phi-3.5-mini corre local, sin costo por token; este numero extrapola los tokens realmente medidos arriba contra el precio publico de `llama-3.1-8b-instant` en Groq (mismo proveedor/familia ya documentado como el swap-target permitido de este proyecto -- ver "Modelo declarado" abajo), $0.05 / 1M tokens entrada, $0.08 / 1M tokens salida (console.groq.com, agosto 2026). Constantes y cita completa en `metrics.go`. |
+
+Placeholder de referencia (correr `curl -s http://localhost:8080/api/v1/metrics/summary`
+contra tu propia sesion para los valores reales):
+
+```json
+{
+  "p50_ms": 0, "p95_ms": 0,
+  "tokens_in_per_turn": 0, "tokens_out_per_turn": 0,
+  "tokens_in_per_call": 0, "tokens_out_per_call": 0,
+  "rag_queries_per_call": 0, "est_cost_per_call": 0
+}
+```
 
 ## Estructura del repositorio
 

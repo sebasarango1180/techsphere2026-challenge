@@ -188,11 +188,15 @@ type CallListItem struct {
 
 // MetricsSummary is what the README's required metrics table (specs/implementation-plan.md
 // §0) gets computed from -- see internal/httpapi/metrics.go for the SQL that fills this in.
+// Both per-turn and per-call token averages are reported since the rubric asks for both
+// (§5), not just one or the other.
 type MetricsSummary struct {
 	P50Ms             float64 `json:"p50_ms"`
 	P95Ms             float64 `json:"p95_ms"`
-	TokensIn          int64   `json:"tokens_in"`
-	TokensOut         int64   `json:"tokens_out"`
+	TokensInPerTurn   float64 `json:"tokens_in_per_turn"`
+	TokensOutPerTurn  float64 `json:"tokens_out_per_turn"`
+	TokensInPerCall   float64 `json:"tokens_in_per_call"`
+	TokensOutPerCall  float64 `json:"tokens_out_per_call"`
 	RAGQueriesPerCall float64 `json:"rag_queries_per_call"`
 	EstCostPerCall    float64 `json:"est_cost_per_call"`
 }

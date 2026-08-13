@@ -13,6 +13,7 @@ type Config struct {
 	Port             string
 	DatabaseURL      string
 	MigrationsPath   string
+	OpenAPIPath      string
 	VectorStoreURL   string
 	LiveKitHostURL   string
 	LiveKitAPIKey    string
@@ -38,6 +39,10 @@ func Load() (Config, error) {
 		// /app/migrations is where the Dockerfile copies infra/postgres/migrations to.
 		// Local (non-Docker) runs need to override this -- see README.md.
 		MigrationsPath:   getenv("MIGRATIONS_PATH", "/app/migrations"),
+		// /app/openapi/api-gateway.yaml is where the Dockerfile bakes docs/openapi/api-gateway.yaml
+		// in (same pattern as MigrationsPath above); local (non-Docker) runs need this pointed
+		// at the real path instead, e.g. OPENAPI_PATH=../../docs/openapi/api-gateway.yaml.
+		OpenAPIPath:      getenv("OPENAPI_PATH", "/app/openapi/api-gateway.yaml"),
 		VectorStoreURL:   getenv("VECTOR_STORE_URL", "http://vector-store:8001"),
 		LiveKitHostURL:   getenv("LIVEKIT_HOST_URL", "http://livekit:7880"),
 		LiveKitAPIKey:    os.Getenv("LIVEKIT_API_KEY"),

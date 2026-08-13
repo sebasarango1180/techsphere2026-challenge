@@ -38,6 +38,8 @@ func NewRouter(s *Server) *gin.Engine {
 	}))
 
 	r.GET("/healthz", s.Healthz)
+	r.GET("/docs", s.Docs)
+	r.GET("/docs/openapi.yaml", s.OpenAPISpec)
 
 	v1 := r.Group("/api/v1")
 	{
