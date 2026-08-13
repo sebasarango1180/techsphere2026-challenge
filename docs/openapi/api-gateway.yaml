@@ -1,0 +1,439 @@
+openapi: 3.0.3
+info:
+  title: api-gateway
+  version: "0.1.0"
+  description: >
+    Control-plane REST API. Frozen contract lives in specs/implementation-plan.md §4.1 --
+    this file is the machine-readable mirror of that table; keep them in sync.
+    TODO(workstream A): this is served at GET /openapi.yaml by api-gateway once
+    implemented (see services/api-gateway/README.md), and should be regenerated from
+    code annotations rather than hand-maintained once the handlers are real.
+servers:
+  - url: http://localhost:8080/api/v1
+paths:
+  /healthz:
+    get:
+      summary: Liveness/readiness probe
+      responses:
+        "200": { description: OK }
+
+  /documents:
+    get:
+      summary: List documents
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DocumentSummary" }
+    post:
+      summary: Upload a document (multipart) for ingestion
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+                title: { type: string }
+                category: { type: string }
+              required: [file, title, category]
+      responses:
+        "202":
+          description: Accepted, processing started
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IngestAccepted" }
+
+  /documents/{id}:
+    put:
+      summary: >-
+        Upload a NEW VERSION of an existing document (re-index) -- multipart, same shape
+        as POST /documents, but title/category are optional (omit to keep existing
+        values). Re-runs OCR-if-needed -> chunk -> embed against the SAME document_id
+        with an incremented version; the prior version's chunks stop being returned by
+        search once this completes (verified end-to-end against a real Postgres +
+        ChromaDB). This is the actual "a PDF is updated" path -- POST /documents always
+        creates a brand new, unrelated document.
+      parameters:
+        - $ref: "#/components/parameters/DocumentId"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+                title: { type: string, description: "optional -- omit to keep existing" }
+                category: { type: string, description: "optional -- omit to keep existing" }
+              required: [file]
+      responses:
+        "202":
+          description: Accepted, reindexing started
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IngestAccepted" }
+    delete:
+      summary: Soft-delete a document (synchronous -- retrieval excludes it before this returns, see plan §2.4)
+      parameters:
+        - $ref: "#/components/parameters/DocumentId"
+      responses:
+        "204": { description: Deleted }
+
+  /documents/{id}/status:
+    get:
+      summary: Processing status, polled by the admin console for "procesado y disponible"
+      parameters:
+        - $ref: "#/components/parameters/DocumentId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentStatus" }
+
+  /patients:
+    get:
+      summary: List patients
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Patient" }
+    post:
+      summary: >-
+        Create a patient. Category is established here, admin-side, before any call --
+        never negotiated live during one (docs/dataset-eda.md §7: the reference
+        conversations never mention the procedure, it's always pre-known).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PatientCreate" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { id: { type: string, format: uuid } }
+
+  /patients/{id}:
+    get:
+      summary: Patient detail
+      parameters:
+        - $ref: "#/components/parameters/PatientId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Patient" }
+
+  /calls:
+    get:
+      summary: >-
+        List calls -- one row per call, joined with patient identity and the current
+        call_summaries snapshot (six signals, final triage, pathology validation). Backs
+        the admin console's "Calls" tab.
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [active, completed, dropped] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CallListItem" }
+    post:
+      summary: >-
+        Start a call session; looks up the patient (if patient_id given), creates the
+        LiveKit room WITH that patient's context as room metadata, then mints an access
+        token. patient_id is optional -- an anonymous call is still valid, it just has
+        no category/patient context for voice-agent to use.
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CallCreateRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CallCreated" }
+
+  /calls/{id}:
+    get:
+      summary: Call detail -- turns, escalation, summary
+      parameters:
+        - $ref: "#/components/parameters/CallId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CallDetail" }
+
+  /calls/{id}/summary:
+    get:
+      summary: Structured end-of-call summary
+      parameters:
+        - $ref: "#/components/parameters/CallId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CallSummary" }
+
+  /escalations:
+    get:
+      summary: List escalation events, optionally filtered by level
+      parameters:
+        - name: level
+          in: query
+          schema: { type: string, enum: [verde, amarillo, rojo] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Escalation" }
+
+  /metrics/summary:
+    get:
+      summary: Aggregated latency/consumption metrics for the README's required metrics table
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MetricsSummary" }
+
+  /internal/livekit/webhook:
+    post:
+      summary: LiveKit room/participant lifecycle webhook receiver
+      responses:
+        "200": { description: OK }
+
+components:
+  parameters:
+    DocumentId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CallId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PatientId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  schemas:
+    Patient:
+      type: object
+      description: >-
+        category is the clean key (e.g. "cholecystitis") decision.py's rule table and
+        vector-store's category_hint key off of; procedure is the human-readable Spanish
+        name -- mirrors the reference dataset's own modulo_synthea/procedimiento split
+        (docs/dataset-eda.md §4).
+      properties:
+        id: { type: string, format: uuid }
+        external_ref: { type: string, nullable: true }
+        name: { type: string }
+        procedure: { type: string, nullable: true }
+        category: { type: string, nullable: true }
+        surgery_date: { type: string, format: date, nullable: true }
+        age: { type: integer, nullable: true }
+        gender: { type: string, nullable: true }
+        comorbidities: { type: array, items: { type: string } }
+        national_id: { type: string, nullable: true }
+        address: { type: string, nullable: true }
+        city: { type: string, nullable: true }
+        department: { type: string, nullable: true }
+        eps: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    PatientCreate:
+      type: object
+      properties:
+        external_ref: { type: string }
+        name: { type: string }
+        procedure: { type: string }
+        category: { type: string }
+        surgery_date: { type: string, format: date }
+        age: { type: integer }
+        gender: { type: string }
+        comorbidities: { type: array, items: { type: string } }
+        national_id: { type: string }
+        address: { type: string }
+        city: { type: string }
+        department: { type: string }
+        eps: { type: string }
+      required: [name, category]
+
+    CallCreateRequest:
+      type: object
+      description: >-
+        All fields optional -- omit patient_id for an anonymous call. patient_name/age/
+        comorbidities are the ad-hoc equivalent for an anonymous caller (call-interface's
+        pre-call form) and are only used when patient_id is empty -- a registered
+        patient's own record is the source of truth otherwise.
+      properties:
+        patient_id: { type: string, format: uuid }
+        postop_day: { type: integer }
+        patient_name: { type: string }
+        age: { type: integer }
+        comorbidities: { type: array, items: { type: string } }
+
+    DocumentSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        category: { type: string }
+        status: { type: string, enum: [active, deleted] }
+        current_version: { type: integer }
+
+    DocumentStatus:
+      type: object
+      properties:
+        status: { type: string, enum: [processing, ready, failed, superseded] }
+        chunk_count: { type: integer }
+
+    IngestAccepted:
+      type: object
+      properties:
+        document_id: { type: string, format: uuid }
+        version: { type: integer }
+        status: { type: string }
+
+    CallCreated:
+      type: object
+      properties:
+        call_id: { type: string, format: uuid }
+        livekit_room: { type: string }
+        livekit_token: { type: string }
+
+    CallDetail:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        patient_id: { type: string, format: uuid, nullable: true }
+        postop_day: { type: integer, nullable: true }
+        status: { type: string, enum: [active, completed, dropped] }
+        turns: { type: array, items: { $ref: "#/components/schemas/Turn" } }
+        escalation:
+          allOf: [{ $ref: "#/components/schemas/Escalation" }]
+          nullable: true
+        summary:
+          allOf: [{ $ref: "#/components/schemas/CallSummary" }]
+          nullable: true
+
+    Turn:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        role: { type: string, enum: [patient, agent, third_party] }
+        text: { type: string }
+        stt_ms: { type: integer, nullable: true }
+        retrieval_ms: { type: integer, nullable: true }
+        llm_ms: { type: integer, nullable: true }
+        tts_ms: { type: integer, nullable: true }
+        tokens_in: { type: integer, nullable: true }
+        tokens_out: { type: integer, nullable: true }
+        retrieved_chunk_ids: { type: array, items: { type: string } }
+        created_at: { type: string, format: date-time }
+
+    CallSummary:
+      type: object
+      description: >-
+        The LIVE clinical snapshot (upserted incrementally during the call, see
+        infra/postgres/migrations/0002_patient_context.up.sql) combined with the
+        end-of-call classification (0003_final_triage.up.sql) and KB-grounded pathology
+        validation (0004_pathology_validation.up.sql). The six structured fields mirror
+        the reference dataset's own trajectory taxonomy exactly (docs/dataset-eda.md §3, §7).
+      properties:
+        procedure: { type: string, nullable: true }
+        symptoms_reported: { type: string, nullable: true }
+        decision: { type: string, nullable: true }
+        references: { type: array, items: { type: object } }
+        next_steps: { type: string, nullable: true }
+        pain_nrs: { type: integer, nullable: true, minimum: 0, maximum: 10 }
+        fever_c: { type: number, nullable: true }
+        mobility: { type: string, nullable: true, enum: [normal, limitada_esperada, incapacitante_nueva] }
+        wound: { type: string, nullable: true, enum: [normal, eritema_leve, secrecion_purulenta] }
+        appetite: { type: string, nullable: true, enum: [normal, levemente_disminuido, muy_disminuido] }
+        sleep: { type: string, nullable: true, enum: [normal, levemente_alterado, muy_alterado] }
+        updated_at: { type: string, format: date-time, nullable: true }
+        final_triage: { type: string, nullable: true, enum: [verde, amarillo, rojo] }
+        triage_rationale: { type: string, nullable: true }
+        triage_confidence: { type: number, nullable: true, minimum: 0, maximum: 1 }
+        missing_info: { type: array, items: { type: string } }
+        pathology_assessment: { type: string, nullable: true }
+        pathology_evidence: { type: array, items: { type: object } }
+
+    CallListItem:
+      type: object
+      description: One row of GET /calls -- calls joined with patient identity and call_summaries.
+      properties:
+        id: { type: string, format: uuid }
+        patient_id: { type: string, format: uuid, nullable: true }
+        patient_name: { type: string, nullable: true }
+        category: { type: string, nullable: true }
+        postop_day: { type: integer, nullable: true }
+        status: { type: string, enum: [active, completed, dropped] }
+        started_at: { type: string, format: date-time }
+        ended_at: { type: string, format: date-time, nullable: true }
+        age: { type: integer, nullable: true }
+        comorbidities: { type: array, items: { type: string } }
+        pain_nrs: { type: integer, nullable: true, minimum: 0, maximum: 10 }
+        fever_c: { type: number, nullable: true }
+        mobility: { type: string, nullable: true, enum: [normal, limitada_esperada, incapacitante_nueva] }
+        wound: { type: string, nullable: true, enum: [normal, eritema_leve, secrecion_purulenta] }
+        appetite: { type: string, nullable: true, enum: [normal, levemente_disminuido, muy_disminuido] }
+        sleep: { type: string, nullable: true, enum: [normal, levemente_alterado, muy_alterado] }
+        final_triage: { type: string, nullable: true, enum: [verde, amarillo, rojo] }
+        triage_rationale: { type: string, nullable: true }
+        triage_confidence: { type: number, nullable: true, minimum: 0, maximum: 1 }
+        missing_info: { type: array, items: { type: string } }
+        pathology_assessment: { type: string, nullable: true }
+        pathology_evidence: { type: array, items: { type: object } }
+
+    Escalation:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        call_id: { type: string, format: uuid }
+        level: { type: string, enum: [verde, amarillo, rojo] }
+        rationale: { type: string }
+        triggered_by: { type: string, enum: [model, rule, both] }
+        cited_documents: { type: array, items: { type: object } }
+
+    MetricsSummary:
+      type: object
+      properties:
+        p50_ms: { type: number }
+        p95_ms: { type: number }
+        tokens_in: { type: integer }
+        tokens_out: { type: integer }
+        rag_queries_per_call: { type: number }
+        est_cost_per_call: { type: number }

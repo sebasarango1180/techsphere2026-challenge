@@ -1,0 +1,216 @@
+# Base compose file. See specs/implementation-plan.md §1/§5 for the service map and
+# §2.5 for why `ollama`, `voice-agent`, AND `vector-store` are profile-gated separately
+# from everything else (macOS/Docker has no Metal passthrough, so scripts/setup.sh runs
+# them natively on the host in that case instead).
+#
+# vector-store joined ollama/voice-agent in the docker-only group after finding, live,
+# that it's the reason BGE-M3 embedding was CPU-only even in native-agent mode: Docker
+# Desktop can't pass through Metal no matter which profile a service carries, so as long
+# as vector-store ran in a container, it never had a chance at MPS. FlagEmbedding
+# already auto-detects MPS correctly (unlike an unrelated bug found the same way in
+# Kokoro's device selection, fixed in voice-agent) -- the fix here is purely "don't run
+# it in Docker on macOS", no application code change needed.
+#
+# `chroma` is deliberately NOT in that same docker-only group, even though it's
+# vector-store's dependency -- Chroma does no GPU/Metal work itself (it's disk I/O + a
+# vector index; embeddings are computed by BGE-M3 and handed to it, its own
+# embedding-function hook is unused, see app/store.py), so there's no reason to run it
+# anywhere but Docker. It runs the official `chromadb/chroma` server image, tagged
+# "tqida" like postgres/livekit -- always on, in BOTH modes -- and vector-store (native
+# or Docker, depending on mode) talks to it over HTTP (`chromadb.HttpClient`), not as an
+# embedded file-backed library anymore. This also means Chroma's data now lives in one
+# place regardless of mode (the `chroma_data` volume below), instead of native mode
+# having its own separate on-host directory.
+#
+# Every OTHER service in this project carries the "tqida" profile, so it's always the
+# base switch for "launch everything that belongs to this project" -- useful mainly to
+# distinguish this stack's services by profile if this host ever runs other Compose
+# projects alongside it. `ollama`/`voice-agent`/`vector-store` carry a SECOND profile
+# each (`docker-models`/`docker-agent`/`docker-models`) INSTEAD of "tqida" -- Compose
+# starts a service if ANY of its profiles is active, so activating "tqida" alone
+# (without the hardware profiles) deliberately excludes them, matching native-agent
+# mode. This also means `--profile tqida` alone skips *building* their images too, not
+# just running them -- real savings against the 15-minute cold-start budget when
+# they're not needed.
+#
+# Usage:
+#   docker compose --profile tqida --profile docker-models --profile docker-agent up -d
+#     # Linux / CPU-or-CUDA default: everything in Docker
+#   docker compose --profile tqida up -d
+#     # macOS native-agent mode: everything except ollama+voice-agent+vector-store,
+#     # which run natively on the host instead (see scripts/setup.sh --native-agent)
+# scripts/setup.sh picks the right invocation for you; see that script before running
+# docker compose by hand.
+
+name: techsphere2026
+
+x-env-file: &env_file
+  env_file:
+    - .env
+
+services:
+  # Schema is applied by api-gateway at startup via golang-migrate (see
+  # services/api-gateway/internal/migrate/migrate.go), not Postgres's own
+  # docker-entrypoint-initdb.d -- that mechanism only runs once against an empty volume
+  # and silently stops applying anything once a second migration file exists.
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["tqida"]
+    <<: *env_file
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-techsphere}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-techsphere}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-techsphere} -d ${POSTGRES_DB:-techsphere}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  livekit:
+    image: livekit/livekit-server:latest
+    command: ["--config", "/etc/livekit.yaml"]
+    profiles: ["tqida"]
+    <<: *env_file
+    environment:
+      # Single source of truth for the API key/secret is .env, not livekit.yaml, so
+      # rotating credentials never means editing two files. See infra/livekit/livekit.yaml.
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-changeme_min_32_chars_______________}"
+    ports:
+      - "7880:7880"   # HTTP/WebSocket signaling
+      - "7881:7881"   # RTC over TCP (fallback)
+      - "50000-50100:50000-50100/udp"  # RTC media (narrow this range in production)
+    volumes:
+      - ./infra/livekit/livekit.yaml:/etc/livekit.yaml:ro
+
+  ollama:
+    image: ollama/ollama:latest
+    # NOT tagged "tqida" -- see top-of-file comment. Only starts (and only gets built/
+    # pulled) when docker-models is explicitly activated too.
+    profiles: ["docker-models"]  # skipped on macOS native-agent mode; see §2.5
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # TODO(workstream E): add docker-compose.gpu.yml override for NVIDIA passthrough on Linux.
+
+  # Official server image, client-server mode (chromadb.HttpClient in vector-store) --
+  # see top-of-file comment for why this one dependency of vector-store's stays in
+  # Docker in BOTH modes instead of following vector-store natively.
+  chroma:
+    image: chromadb/chroma:1.5.9   # pinned to match the chromadb client version vector-store uses
+    profiles: ["tqida"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/data   # confirmed live: this image's default persist path
+
+  vector-store:
+    build:
+      context: ./services/vector-store
+    # NOT tagged "tqida" -- see top-of-file comment. Only starts (and only gets built)
+    # when docker-models is explicitly activated too; runs natively on the host in
+    # native-agent mode instead, for Metal (see scripts/setup.sh).
+    profiles: ["docker-models"]
+    <<: *env_file
+    environment:
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+    ports:
+      - "8001:8001"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      chroma:
+        condition: service_started
+
+  api-gateway:
+    build:
+      # Context is the repo root, not services/api-gateway -- see that Dockerfile's
+      # top comment for why (it needs infra/postgres/migrations/ in its build context).
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    profiles: ["tqida"]
+    <<: *env_file
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://techsphere:changeme@postgres:5432/techsphere?sslmode=disable}
+      # api-gateway always runs in Docker (both modes), but vector-store doesn't (native-
+      # agent mode runs it on the host for Metal -- see top-of-file comment). Interpolated
+      # rather than hardcoded so scripts/setup.sh can override it to
+      # http://host.docker.internal:8001 in that mode; defaults to the compose-internal
+      # hostname, correct for full-Docker mode.
+      VECTOR_STORE_URL: ${VECTOR_STORE_URL:-http://vector-store:8001}
+      LIVEKIT_HOST_URL: http://livekit:7880
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+      # vector-store deliberately NOT here (unlike before) -- in native-agent mode it
+      # isn't a Compose-managed service at all (docker-models profile, not active), and
+      # Compose hard-errors on a depends_on referencing a profile-excluded service
+      # ("depends on undefined service") -- verified live. scripts/setup.sh's own
+      # explicit health-wait covers the ordering this used to express.
+
+  voice-agent:
+    build:
+      context: ./services/voice-agent
+    # NOT tagged "tqida" -- see top-of-file comment. Only starts (and only gets built)
+    # when docker-agent is explicitly activated too.
+    profiles: ["docker-agent"]  # skipped on macOS native-agent mode; see §2.5
+    <<: *env_file
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://techsphere:changeme@postgres:5432/techsphere?sslmode=disable}
+      VECTOR_STORE_URL: http://vector-store:8001
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
+      LIVEKIT_URL: ${LIVEKIT_URL:-ws://livekit:7880}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vector-store:
+        condition: service_started
+      livekit:
+        condition: service_started
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+
+  # Two separate apps, not one SPA with two routes -- different audiences (patient vs
+  # admin) and different auth postures going forward. See specs/implementation-plan.md §1.
+  call-interface:
+    build:
+      context: ./frontend/call-interface
+      args:
+        # Vite bakes these in at build time -- see that Dockerfile's comment.
+        VITE_API_GATEWAY_URL: ${VITE_API_GATEWAY_URL:-http://localhost:8080}
+        VITE_LIVEKIT_URL: ${VITE_LIVEKIT_URL:-ws://localhost:7880}
+    profiles: ["tqida"]
+    <<: *env_file
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api-gateway
+
+  admin-console:
+    build:
+      context: ./frontend/admin-console
+      args:
+        VITE_API_GATEWAY_URL: ${VITE_API_GATEWAY_URL:-http://localhost:8080}
+    profiles: ["tqida"]
+    <<: *env_file
+    ports:
+      - "5174:5174"
+    depends_on:
+      - api-gateway
+
+volumes:
+  pgdata:
+  ollama_data:
+  chroma_data:
+  hf_cache:

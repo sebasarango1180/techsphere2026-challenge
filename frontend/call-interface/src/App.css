@@ -1,0 +1,332 @@
+/* UX considerations from scaffolding.md: big and clear buttons and text, clean
+   interfacing, easy for a patient with no assumed technical literacy. Visual language:
+   soft gradients + glass surfaces + motion cues so the app reads as "alive" while
+   staying calm -- a post-surgical patient population is not who you want a jittery or
+   sterile-feeling interface for. */
+
+.app-shell {
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.brand-logo {
+  font-style: italic;
+  font-weight: 800;
+  font-size: 24px;
+  letter-spacing: -0.01em;
+  margin-bottom: 28px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  user-select: none;
+}
+
+h1 {
+  font-size: 34px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  margin: 0 0 8px;
+}
+
+.subtitle {
+  color: var(--text-muted);
+  margin: 0 0 32px;
+  font-size: 19px;
+}
+
+.big-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  font-size: 22px;
+  font-weight: 700;
+  padding: 20px 36px;
+  border-radius: 999px;
+  border: none;
+  cursor: pointer;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: white;
+  min-width: 220px;
+  box-shadow: 0 12px 30px -10px var(--glow);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+}
+
+.big-button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 16px 36px -10px var(--glow);
+}
+
+.big-button:active {
+  transform: translateY(0);
+}
+
+.big-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.big-button.danger {
+  background: var(--danger);
+  box-shadow: 0 12px 30px -10px color-mix(in srgb, var(--danger) 45%, transparent);
+}
+
+.big-button.secondary {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: none;
+}
+
+.call-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+  text-align: center;
+  padding: 48px 36px;
+  width: 100%;
+  max-width: 460px;
+  background: var(--surface-glass);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  animation: stage-in 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes stage-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.call-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid var(--border);
+}
+
+.call-status::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--verde);
+  box-shadow: 0 0 8px var(--verde);
+}
+
+.error-banner {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  padding: 14px 18px;
+  border-radius: 14px;
+  margin-bottom: 4px;
+  font-size: 16px;
+  width: 100%;
+}
+
+.precall-form {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  max-width: 360px;
+}
+
+.precall-hint {
+  color: var(--text-muted);
+  font-size: 15px;
+  margin: 0;
+}
+
+.precall-form input {
+  width: 100%;
+  font-size: 18px;
+  padding: 14px 16px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.precall-form input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px var(--glow);
+}
+
+/* --- Agent presence: the orb + label that answers "is anything happening?" the moment
+   the call connects, before any audio exists to visualize. States map 1:1 onto
+   @livekit/components-react's AgentState (useVoiceAssistant) -- see App.tsx. --- */
+
+.agent-presence {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  width: 100%;
+}
+
+.agent-orb-wrap {
+  position: relative;
+  width: 184px;
+  height: 184px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Soft stationary glow behind the orb -- gives the whole presence area a "the caller is
+   the focal point of this screen" anchor even while the orb itself is mid-pulse. */
+.agent-orb-wrap::after {
+  content: '';
+  position: absolute;
+  inset: -18px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--glow), transparent 70%);
+  z-index: -1;
+  opacity: 0.8;
+}
+
+.agent-orb {
+  width: 140px;
+  height: 140px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 32% 30%, var(--accent-2), var(--accent) 72%);
+  box-shadow: 0 0 0 0 var(--glow);
+  animation: orb-pulse 2.6s ease-in-out infinite;
+  transition: filter 0.3s ease;
+}
+
+@keyframes orb-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 var(--glow);
+    transform: scale(1);
+  }
+  50% {
+    box-shadow: 0 0 0 20px transparent;
+    transform: scale(1.045);
+  }
+}
+
+/* Connecting/initializing: a spinning ring around the orb makes it unambiguous that
+   something is actively happening even though no audio exists yet -- this is what
+   answers "the greeting may take a moment" without the patient wondering if the call
+   is frozen. */
+.agent-orb-wrap.state-connecting .agent-orb,
+.agent-orb-wrap.state-initializing .agent-orb {
+  opacity: 0.8;
+  animation-duration: 1.8s;
+}
+
+.agent-orb-wrap.state-connecting::before,
+.agent-orb-wrap.state-initializing::before {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  border: 3px solid transparent;
+  border-top-color: var(--accent);
+  border-right-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  animation: orb-spin 1s linear infinite;
+}
+
+@keyframes orb-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.agent-orb-wrap.state-listening .agent-orb {
+  animation-duration: 3.2s;
+}
+
+.agent-orb-wrap.state-thinking .agent-orb {
+  animation-duration: 1.5s;
+  filter: saturate(0.6);
+}
+
+.agent-orb-wrap.state-speaking .agent-orb {
+  animation-duration: 1s;
+}
+
+.agent-state-label {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-muted);
+  min-height: 22px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-state-label .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: dot-blink 1.4s ease-in-out infinite;
+}
+
+@keyframes dot-blink {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* BarVisualizer's documented CSS hooks (--lk-fg / --lk-va-bg custom properties, plus
+   .lk-audio-bar / .lk-highlighted classes for finer control). */
+.agent-visualizer {
+  --lk-fg: var(--accent);
+  --lk-va-bg: color-mix(in srgb, var(--accent) 16%, transparent);
+  width: 220px;
+  height: 64px;
+  gap: 5px;
+}
+
+.agent-visualizer .lk-audio-bar {
+  border-radius: 999px;
+  transition: transform 0.08s ease;
+}
+
+.agent-visualizer .lk-audio-bar.lk-highlighted {
+  background: linear-gradient(180deg, var(--accent-2), var(--accent));
+}
+
+.call-controls {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  justify-content: center;
+}

@@ -1,0 +1,121 @@
+openapi: 3.0.3
+info:
+  title: vector-store
+  version: "0.1.0"
+  description: >
+    Knowledge ingestion + hybrid search engine. Frozen contract in
+    specs/implementation-plan.md §4.2. Identity (document_id) is assigned by api-gateway,
+    not here -- this service is a processing/index engine, not an ID authority (plan §2.4).
+servers:
+  - url: http://localhost:8001/v1
+paths:
+  /healthz:
+    get:
+      summary: Liveness/readiness probe
+      responses:
+        "200": { description: OK }
+
+  /ingest:
+    post:
+      summary: Parse, chunk, embed, and index a document version
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                document_id: { type: string, format: uuid }
+                version: { type: integer }
+                category: { type: string }
+                file: { type: string, format: binary }
+              required: [document_id, version, category, file]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IngestResult" }
+
+  /documents/{document_id}:
+    delete:
+      summary: Soft-delete all chunks for a document (synchronous, excludes from search immediately)
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "204": { description: Deleted }
+
+  /documents/{document_id}/status:
+    get:
+      summary: Processing status for a document's active version
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentStatus" }
+
+  /search:
+    post:
+      summary: Hybrid (dense BGE-M3 + sparse BM25, RRF-fused) search over active chunks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SearchRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SearchHit" }
+
+components:
+  schemas:
+    IngestResult:
+      type: object
+      properties:
+        chunk_count: { type: integer }
+        status: { type: string, enum: [processing, ready, failed] }
+
+    DocumentStatus:
+      type: object
+      properties:
+        status: { type: string, enum: [processing, ready, failed, superseded, deleted] }
+        chunk_count: { type: integer }
+
+    SearchRequest:
+      type: object
+      properties:
+        query: { type: string }
+        top_k: { type: integer, default: 8 }
+        category_hint:
+          type: string
+          nullable: true
+          description: >-
+            e.g. "cholecystitis" -- a SOFT ranking nudge, not a hard filter. Matching
+            chunks are boosted, non-matching chunks are still returned. See
+            services/vector-store/app/hybrid_search.py's module docstring /
+            docs/dataset-eda.md §5,§7 for why category is never used to exclude results.
+      required: [query]
+
+    SearchHit:
+      type: object
+      properties:
+        chunk_id: { type: string }
+        document_id: { type: string, format: uuid }
+        version: { type: integer }
+        text: { type: string }
+        page: { type: integer }
+        score: { type: number }
+        source: { type: string, enum: [dense, bm25, both] }

@@ -1,0 +1,24 @@
+# LiveKit server config for local/dev use. API key/secret are intentionally NOT here:
+# they're injected via the LIVEKIT_KEYS env var in docker-compose.yml so .env stays the
+# single source of truth for credentials (see docker-compose.yml's `livekit` service).
+#
+# See specs/implementation-plan.md §2.6 for how api-gateway mints per-call tokens against
+# this server, and §2.5/§8 for why the RTC UDP port range matters for the 15-minute /
+# no-real-telephony constraints (NAT traversal on the grader's network is a real risk --
+# TODO(workstream E): if the grading machine is behind restrictive NAT, configure
+# `rtc.use_external_ip` / a TURN server here and document it in the README).
+
+port: 7880
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50100
+  use_external_ip: false
+
+# Local dev: single-node, no Redis needed. If this ever needs to scale beyond one
+# livekit-server instance, a `redis:` block is required for room state coordination --
+# not needed for this challenge's single-machine deployment target.
+
+logging:
+  level: info

@@ -488,3 +488,22 @@ pyrightconfig.json
 .ionide
 
 # End of https://www.toptal.com/developers/gitignore/api/linux,macos,python,go,visualstudiocode,intellij+all,node
+
+### Project-specific ###
+# Local copy of the challenge dataset (127MB of PDFs + xlsx) -- not vendored, matches
+# specs/implementation-plan.md §5. Source of truth is the ParticipantArtifacts repo;
+# scripts/setup.sh clones it at setup time. See docs/dataset-eda.md.
+/dataset/
+
+# vector-store's Chroma persistence when running natively (macOS native-agent mode --
+# Docker mode uses a named Docker volume instead, see docker-compose.yml). Equivalent
+# to that volume: real data, not vendored.
+/.native-data/
+
+# Pre-computed KB seed (scripts/export_kb_seed.sh / import_kb_seed.sh) -- ~100MB, too
+# large for normal git history. Not committed here; where/how to publish it (GitHub
+# Release, Git LFS, object storage) is a separate decision -- see export_kb_seed.sh's
+# docstring.
+# /kb-seed.tar.gz
+/.kb-seed-build/
+/.kb-seed-restore/
