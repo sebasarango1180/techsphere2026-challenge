@@ -1,17 +1,23 @@
 :root {
-  --text: #1f2430;
-  --text-muted: #5b6270;
-  --bg: #fdfdfd;
+  --text: #1a1d29;
+  --text-muted: #656d7d;
+  --bg: #f6f7fb;
   --surface: #ffffff;
-  --border: #e2e4e9;
-  --accent: #3b6ef2;
-  --accent-hover: #2d57c9;
-  --danger: #d33b3b;
-  --amarillo: #b8860b;
-  --rojo: #c0392b;
-  --verde: #2f7d3d;
+  --surface-glass: rgba(255, 255, 255, 0.72);
+  --border: #e4e7ee;
+  --accent: #4f6ef7;
+  --accent-2: #8b5cf6;
+  --accent-hover: #3d5ae0;
+  --danger: #e0455a;
+  --amarillo: #c8930b;
+  --rojo: #d5473c;
+  --verde: #21935a;
+  --glow: rgba(79, 110, 247, 0.32);
+  --shadow: 0 24px 60px -24px rgba(20, 24, 40, 0.28);
+  --radius-lg: 24px;
+  --radius-md: 16px;
 
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
 
   font: 18px/145% var(--sans);
   color-scheme: light dark;
@@ -22,13 +28,17 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --text: #eef0f4;
-    --text-muted: #a6adba;
-    --bg: #14161c;
-    --surface: #1c1f27;
-    --border: #2c303a;
-    --accent: #6f9bff;
-    --accent-hover: #8fb0ff;
+    --text: #eef1f8;
+    --text-muted: #9aa3b8;
+    --bg: #0a0c14;
+    --surface: #12151f;
+    --surface-glass: rgba(20, 23, 34, 0.62);
+    --border: #262b3a;
+    --accent: #7c96ff;
+    --accent-2: #a78bfa;
+    --accent-hover: #93a8ff;
+    --glow: rgba(124, 150, 255, 0.38);
+    --shadow: 0 24px 60px -24px rgba(0, 0, 0, 0.65);
   }
 }
 
@@ -38,8 +48,24 @@
 
 body {
   margin: 0;
+  min-height: 100svh;
+  background:
+    radial-gradient(circle at 8% -15%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 50%),
+    radial-gradient(circle at 105% 0%, color-mix(in srgb, var(--accent-2) 12%, transparent), transparent 45%),
+    var(--bg);
+  background-attachment: fixed;
 }
 
 button {
   font-family: inherit;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

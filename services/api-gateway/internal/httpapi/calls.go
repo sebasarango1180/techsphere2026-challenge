@@ -49,6 +49,14 @@ func (s *Server) CreateCall(c *gin.Context) {
 	room := "call-" + callID
 
 	var patientID *string
+	// Ad-hoc context (anonymous-call path only) -- persisted onto the calls row itself
+	// below, not just sent as room metadata, so the admin console's Calls tab has
+	// something to read after the call ends (found live: it was reaching voice-agent
+	// fine but was never written to Postgres anywhere, so the console always showed
+	// "Paciente anonimo" regardless of what the caller typed into the pre-call form).
+	var adHocName *string
+	var adHocAge *int
+	var adHocComorbidities []string
 	meta := roomMetadata{PostopDay: req.PostopDay}
 	if req.PatientID != "" {
 		var name string
@@ -75,6 +83,11 @@ func (s *Server) CreateCall(c *gin.Context) {
 		meta.PatientName = req.PatientName
 		meta.Age = req.Age
 		meta.Comorbidities = req.Comorbidities
+		if req.PatientName != "" {
+			adHocName = &req.PatientName
+		}
+		adHocAge = req.Age
+		adHocComorbidities = req.Comorbidities
 	}
 
 	metadataJSON, err := json.Marshal(meta)
@@ -98,10 +111,21 @@ func (s *Server) CreateCall(c *gin.Context) {
 		return
 	}
 
+	if adHocComorbidities == nil {
+		adHocComorbidities = []string{}
+	}
+	adHocComorbiditiesJSON, err := json.Marshal(adHocComorbidities)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	if _, err := s.DB.Exec(ctx, `
-		INSERT INTO calls (id, patient_id, postop_day, status, stt_mode, llm_model, livekit_room)
-		VALUES ($1, $2, $3, 'active', $4, $5, $6)
-	`, callID, patientID, req.PostopDay, s.Cfg.STTMode, s.Cfg.LLMModel, room); err != nil {
+		INSERT INTO calls (id, patient_id, postop_day, status, stt_mode, llm_model, livekit_room,
+		                    patient_name, age, comorbidities)
+		VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8, $9::jsonb)
+	`, callID, patientID, req.PostopDay, s.Cfg.STTMode, s.Cfg.LLMModel, room,
+		adHocName, adHocAge, string(adHocComorbiditiesJSON)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -213,8 +237,13 @@ func (s *Server) ListCalls(c *gin.Context) {
 	ctx := c.Request.Context()
 	status := c.Query("status")
 
+	// COALESCE(p.name, c.patient_name) etc: a registered patient's own record wins when
+	// there is one; otherwise fall back to the ad-hoc columns populated for an anonymous
+	// call (see infra/postgres/migrations/0005_anonymous_call_context.up.sql).
 	const selectClause = `
-		SELECT c.id, c.patient_id, p.name, p.category, c.postop_day, c.status, c.started_at, c.ended_at,
+		SELECT c.id, c.patient_id, COALESCE(p.name, c.patient_name), p.category, c.postop_day,
+		       c.status, c.started_at, c.ended_at,
+		       COALESCE(p.age, c.age), COALESCE(p.comorbidities, c.comorbidities, '[]'::jsonb),
 		       cs.pain_nrs, cs.fever_c, cs.mobility, cs.wound, cs.appetite, cs.sleep,
 		       cs.final_triage, cs.triage_rationale, cs.triage_confidence,
 		       COALESCE(cs.missing_info, '[]'::jsonb),
@@ -243,6 +272,7 @@ func (s *Server) ListCalls(c *gin.Context) {
 		if err := rows.Scan(
 			&item.ID, &item.PatientID, &item.PatientName, &item.Category, &item.PostopDay,
 			&item.Status, &item.StartedAt, &item.EndedAt,
+			&item.Age, &item.Comorbidities,
 			&item.PainNRS, &item.FeverC, &item.Mobility, &item.Wound, &item.Appetite, &item.Sleep,
 			&item.FinalTriage, &item.TriageRationale, &item.TriageConfidence,
 			&item.MissingInfo, &item.PathologyAssessment, &item.PathologyEvidence,

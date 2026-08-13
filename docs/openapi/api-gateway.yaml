@@ -403,6 +403,8 @@ components:
         status: { type: string, enum: [active, completed, dropped] }
         started_at: { type: string, format: date-time }
         ended_at: { type: string, format: date-time, nullable: true }
+        age: { type: integer, nullable: true }
+        comorbidities: { type: array, items: { type: string } }
         pain_nrs: { type: integer, nullable: true, minimum: 0, maximum: 10 }
         fever_c: { type: number, nullable: true }
         mobility: { type: string, nullable: true, enum: [normal, limitada_esperada, incapacitante_nueva] }

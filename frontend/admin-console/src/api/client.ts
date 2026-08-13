@@ -43,6 +43,9 @@ export interface CallListItem {
   started_at: string
   ended_at?: string
 
+  age?: number
+  comorbidities: string[]
+
   pain_nrs?: number
   fever_c?: number
   mobility?: 'normal' | 'limitada_esperada' | 'incapacitante_nueva'

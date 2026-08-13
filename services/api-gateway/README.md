@@ -79,8 +79,11 @@ What's still open, in priority order for G2/G3/G4/G5:
 - [ ] Auth: deliberately none, matching the challenge's explicit exclusion of "autenticacion
       empresarial o gestion de roles" from required scope -- this is a scope decision, not
       an oversight; documented here and in the informe rather than silently shipped
-- [ ] No admin-console UI exists yet to actually create/browse patients through -- the
-      API is real and tested, but today only reachable via curl/Postman
+- [ ] No admin-console UI exists yet to create/browse *patients* through (`GET /patients`
+      is real and tested, but today only reachable via curl/Postman) -- the console does
+      now have a "Llamadas" tab reading `GET /calls`, which joins `calls`/`patients`/
+      `call_summaries` into one list (six signals, final triage, pathology validation) so
+      the admin console doesn't need N+1 requests per call
 
 ## Run locally (outside Docker)
 

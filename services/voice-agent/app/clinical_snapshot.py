@@ -20,6 +20,7 @@ an out-of-vocabulary or out-of-range value from the model is dropped (logged, no
 crashed on) rather than passed through to a database write that would reject it.
 """
 
+import difflib
 import logging
 from dataclasses import dataclass, fields
 
@@ -106,6 +107,18 @@ class ClinicalSnapshot:
         normalized = value.strip().lower().replace(" ", "_") if isinstance(value, str) else value
         if normalized in valid:
             setattr(self, field, normalized)
+            return
+        # Found live, reproducibly (3/3 in one test run): the model sometimes misspells
+        # an otherwise-correct enum value ("levantemente_alterado" -- not a real Spanish
+        # word -- instead of "levemente_alterado"). Plain normalization doesn't fix a
+        # typo, and dropping a value the model clearly intended (one edit away from a
+        # real option) loses real signal for no reason. A close, unambiguous match
+        # (cutoff=0.8, i.e. still requires the strings to be genuinely close) is treated
+        # as that value; anything more different is still dropped rather than guessed.
+        close = difflib.get_close_matches(normalized, valid, n=1, cutoff=0.8) if isinstance(normalized, str) else []
+        if close:
+            logger.warning("correcting likely-misspelled %s from model: %r -> %r", field, value, close[0])
+            setattr(self, field, close[0])
         else:
             logger.warning("dropping out-of-vocabulary %s from model: %r", field, value)
 

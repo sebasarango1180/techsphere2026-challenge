@@ -5,6 +5,9 @@ import {
   TrackToggle,
   DisconnectButton,
   useConnectionState,
+  useVoiceAssistant,
+  BarVisualizer,
+  type AgentState,
 } from '@livekit/components-react'
 import { DisconnectReason, Track } from 'livekit-client'
 import '@livekit/components-styles'
@@ -87,63 +90,65 @@ export default function App() {
 
   if (phase === 'idle' || phase === 'connecting') {
     return (
-      <div className="call-stage">
-        <h1>Llamada de seguimiento</h1>
-        <p className="subtitle">
-          Presiona el boton para iniciar tu llamada de voz con el asistente.
-        </p>
-        {error && <div className="error-banner">{error}</div>}
-        <form
-          className="precall-form"
-          onSubmit={(e) => {
-            e.preventDefault()
-            startCall()
-          }}
-        >
-          <p className="precall-hint">Opcional: cuentanos un poco sobre ti antes de empezar.</p>
-          <input
-            type="text"
-            placeholder="Tu nombre"
-            value={patientName}
-            onChange={(e) => setPatientName(e.target.value)}
-            disabled={phase === 'connecting'}
-          />
-          <input
-            type="number"
-            min={0}
-            max={120}
-            placeholder="Edad"
-            value={age}
-            onChange={(e) => setAge(e.target.value)}
-            disabled={phase === 'connecting'}
-          />
-          <input
-            type="text"
-            placeholder="Condiciones preexistentes (ej. diabetes, hipertension)"
-            value={conditions}
-            onChange={(e) => setConditions(e.target.value)}
-            disabled={phase === 'connecting'}
-          />
-          <button type="submit" className="big-button" disabled={phase === 'connecting'}>
-            {phase === 'connecting' ? 'Conectando...' : 'Iniciar llamada'}
-          </button>
-        </form>
+      <div className="app-shell">
+        <div className="call-stage">
+          <h1>Llamada de seguimiento</h1>
+          <p className="subtitle">Presiona el boton para iniciar tu llamada de voz con el asistente.</p>
+          {error && <div className="error-banner">{error}</div>}
+          <form
+            className="precall-form"
+            onSubmit={(e) => {
+              e.preventDefault()
+              startCall()
+            }}
+          >
+            <p className="precall-hint">Opcional: cuentanos un poco sobre ti antes de empezar.</p>
+            <input
+              type="text"
+              placeholder="Tu nombre"
+              value={patientName}
+              onChange={(e) => setPatientName(e.target.value)}
+              disabled={phase === 'connecting'}
+            />
+            <input
+              type="number"
+              min={0}
+              max={120}
+              placeholder="Edad"
+              value={age}
+              onChange={(e) => setAge(e.target.value)}
+              disabled={phase === 'connecting'}
+            />
+            <input
+              type="text"
+              placeholder="Condiciones preexistentes (ej. diabetes, hipertension)"
+              value={conditions}
+              onChange={(e) => setConditions(e.target.value)}
+              disabled={phase === 'connecting'}
+            />
+            <button type="submit" className="big-button" disabled={phase === 'connecting'}>
+              {phase === 'connecting' ? 'Conectando...' : 'Iniciar llamada'}
+            </button>
+          </form>
+        </div>
       </div>
     )
   }
 
   if (phase === 'reconnect-needed' && call) {
     return (
-      <div className="call-stage">
-        <h1>Se perdio la conexion</h1>
-        <p className="subtitle">Tu llamada sigue activa. Presiona para reconectar.</p>
-        <div style={{ display: 'flex', gap: 16 }}>
-          <button type="button" className="big-button" onClick={reconnect}>
-            Reconectar
-          </button>
-          <button type="button" className="big-button danger" onClick={endCall}>
-            Terminar llamada
-          </button>
+      <div className="app-shell">
+        <div className="call-stage">
+          <h1>Se perdio la conexion</h1>
+          <p className="subtitle">Tu llamada sigue activa. Presiona para reconectar.</p>
+          <div className="call-controls">
+            <button type="button" className="big-button" onClick={reconnect}>
+              Reconectar
+            </button>
+            <button type="button" className="big-button danger" onClick={endCall}>
+              Terminar llamada
+            </button>
+          </div>
         </div>
       </div>
     )
@@ -152,30 +157,67 @@ export default function App() {
   if (!call) return null
 
   return (
-    <LiveKitRoom
-      key={attempt}
-      serverUrl={LIVEKIT_URL}
-      token={call.livekit_token}
-      audio
-      connect
-      onDisconnected={handleDisconnected}
-      data-lk-theme="default"
-    >
-      <ActiveCall />
-      <RoomAudioRenderer />
-    </LiveKitRoom>
+    <div className="app-shell">
+      <LiveKitRoom
+        key={attempt}
+        serverUrl={LIVEKIT_URL}
+        token={call.livekit_token}
+        audio
+        connect
+        onDisconnected={handleDisconnected}
+        data-lk-theme="default"
+      >
+        <ActiveCall />
+        <RoomAudioRenderer />
+      </LiveKitRoom>
+    </div>
   )
 }
 
+// Spanish labels for @livekit/components-react's AgentState (useVoiceAssistant) -- this
+// is what turns "the greeting may take a moment" from a silent wait into a visible,
+// continuously-updating status, all the way from the moment the room connects through
+// the agent's prewarm/greeting to normal turn-taking.
+const STATE_LABELS_ES: Partial<Record<AgentState, string>> = {
+  connecting: 'Conectando con tu asistente',
+  'pre-connect-buffering': 'Conectando con tu asistente',
+  initializing: 'Preparando tu asistente',
+  idle: 'Preparando tu asistente',
+  listening: 'Escuchando',
+  thinking: 'Pensando',
+  speaking: 'Hablando',
+  disconnected: 'Desconectado',
+  failed: 'No se pudo conectar',
+}
+
+const WAITING_STATES: AgentState[] = ['connecting', 'pre-connect-buffering', 'initializing', 'idle']
+
 function ActiveCall() {
   const connectionState = useConnectionState()
+  const { state, audioTrack } = useVoiceAssistant()
+  const label = STATE_LABELS_ES[state] ?? 'Conectando con tu asistente'
+  const waiting = WAITING_STATES.includes(state)
 
   return (
     <div className="call-stage">
       <h1>Llamada en curso</h1>
-      <p className="call-status">Estado: {connectionState}</p>
-      <div style={{ display: 'flex', gap: 16 }}>
-        <TrackToggle source={Track.Source.Microphone} className="big-button">
+
+      <div className="agent-presence">
+        <div className={`agent-orb-wrap state-${state}`}>
+          <div className="agent-orb" />
+        </div>
+        <BarVisualizer state={state} trackRef={audioTrack} barCount={5} className="agent-visualizer" />
+        <p className="agent-state-label">
+          {waiting && <span className="dot" />}
+          {label}
+          {waiting && '...'}
+        </p>
+      </div>
+
+      <p className="call-status">Conexion: {connectionState}</p>
+
+      <div className="call-controls">
+        <TrackToggle source={Track.Source.Microphone} className="big-button secondary">
           Silenciar microfono
         </TrackToggle>
         <DisconnectButton className="big-button danger">Terminar llamada</DisconnectButton>

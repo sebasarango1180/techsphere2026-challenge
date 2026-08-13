@@ -164,6 +164,13 @@ type CallListItem struct {
 	StartedAt   time.Time  `json:"started_at"`
 	EndedAt     *time.Time `json:"ended_at,omitempty"`
 
+	// Age/Comorbidities: from patients (registered patient) or calls' own ad-hoc columns
+	// (anonymous call, call-interface's pre-call form) -- see infra/postgres/migrations/
+	// 0005_anonymous_call_context.up.sql. PatientName above is already the same kind of
+	// COALESCE.
+	Age           *int  `json:"age,omitempty"`
+	Comorbidities []any `json:"comorbidities"`
+
 	PainNRS  *int     `json:"pain_nrs,omitempty"`
 	FeverC   *float64 `json:"fever_c,omitempty"`
 	Mobility *string  `json:"mobility,omitempty"`

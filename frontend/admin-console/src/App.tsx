@@ -287,10 +287,19 @@ function CallCard({ call }: { call: CallListItem }) {
         <div>
           <h2 style={{ margin: 0 }}>{call.patient_name ?? 'Paciente anonimo'}</h2>
           <p className="subtitle" style={{ margin: '4px 0 0' }}>
-            {[call.category, call.postop_day != null ? `dia ${call.postop_day} post-operatorio` : null]
+            {[
+              call.category,
+              call.postop_day != null ? `dia ${call.postop_day} post-operatorio` : null,
+              call.age != null ? `${call.age} anos` : null,
+            ]
               .filter(Boolean)
               .join(' · ') || 'Sin contexto de procedimiento'}
           </p>
+          {call.comorbidities.length > 0 && (
+            <p className="subtitle" style={{ margin: '4px 0 0' }}>
+              Condiciones preexistentes: {call.comorbidities.join(', ')}
+            </p>
+          )}
         </div>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
           <span className={`status-pill ${call.status}`}>{call.status}</span>
