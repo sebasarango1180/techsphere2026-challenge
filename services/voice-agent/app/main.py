@@ -619,42 +619,52 @@ async def _validate_pathology(
         patient_context_parts.append(f"Condiciones preexistentes: {', '.join(call_ctx.comorbidities)}")
     user_content = ". ".join(patient_context_parts)
 
-    async def _call_once(reminder: str = "") -> dict:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{settings.ollama_host}/api/chat",
-                json={
-                    "model": settings.ollama_model,
-                    "messages": [
-                        {"role": "system", "content": PATHOLOGY_VALIDATION_PROMPT_ES},
-                        {"role": "system", "content": kb_context},
-                        {"role": "user", "content": user_content + reminder},
-                    ],
-                    "format": "json",
-                    "stream": False,
-                },
-            )
-            resp.raise_for_status()
-            return json.loads(resp.json()["message"]["content"])
+    async def _call_once(reminder: str = "") -> dict | None:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{settings.ollama_host}/api/chat",
+                    json={
+                        "model": settings.ollama_model,
+                        "messages": [
+                            {"role": "system", "content": PATHOLOGY_VALIDATION_PROMPT_ES},
+                            {"role": "system", "content": kb_context},
+                            {"role": "user", "content": user_content + reminder},
+                        ],
+                        "format": "json",
+                        "stream": False,
+                    },
+                )
+                resp.raise_for_status()
+                return json.loads(resp.json()["message"]["content"])
+        except Exception:
+            # Covers BOTH failure modes found live: the HTTP/transport call itself
+            # failing, and the model's reply not even being parseable JSON (found live:
+            # "format": "json" only enforces syntax on a best-effort basis -- a truncated
+            # or rambling reply can still fail json.loads outright, not just come back
+            # missing a key). Returning None (not raising) lets the retry below fire for
+            # this failure mode too, not just the missing-key one.
+            logger.exception("call_id=%s pathology validation call failed", call_id)
+            return None
 
-    # Retried once on schema drift (missing "pathology_assessment" despite a
-    # syntactically-valid JSON reply -- found live: phi3.5:3.8b occasionally omits it,
-    # `format: "json"` only enforces valid syntax, not our schema) before giving up --
-    # cheap insurance against the exact silent-empty-field failure this was found from,
-    # since the model is non-deterministic enough that a second attempt usually recovers.
-    try:
-        result = await _call_once()
-        if not result.get("pathology_assessment"):
-            logger.warning("call_id=%s pathology validation missing pathology_assessment on first attempt, retrying -- raw=%r", call_id, result)
-            result = await _call_once(
-                "\n\nRECORDATORIO: tu respuesta anterior no incluyo la clave \"pathology_assessment\" "
-                "requerida. Responde SOLO con el JSON exacto {\"pathology_assessment\": \"...\", "
-                "\"pathology_citations\": [...]}, sin omitir ninguna clave."
-            )
-        return result
-    except Exception:
-        logger.exception("pathology validation failed for call_id=%s", call_id)
-        return {}
+    # Retried once on ANY failure to produce a usable {"pathology_assessment": ...} dict
+    # -- either this call outright failing/erroring, or schema drift (missing the key
+    # despite syntactically-valid JSON; found live: phi3.5:3.8b occasionally omits it,
+    # `format: "json"` only enforces valid syntax, not our schema). Cheap insurance
+    # against the exact silent-empty-field failure this was found from, since the model
+    # is non-deterministic enough that a second attempt usually recovers either way.
+    result = await _call_once()
+    if not result or not result.get("pathology_assessment"):
+        logger.warning("call_id=%s pathology validation %s on first attempt, retrying -- raw=%r", call_id, "failed" if result is None else "missing pathology_assessment", result)
+        retry_result = await _call_once(
+            "\n\nRECORDATORIO: tu respuesta anterior no incluyo la clave \"pathology_assessment\" "
+            "requerida (o no era JSON valido). Responde SOLO con el JSON exacto "
+            "{\"pathology_assessment\": \"...\", \"pathology_citations\": [...]}, sin omitir "
+            "ninguna clave y sin texto fuera del JSON."
+        )
+        if retry_result is not None:
+            result = retry_result
+    return result or {}
 
 
 async def _generate_narrative_summary(transcript: str, call_id: str) -> dict:

@@ -213,23 +213,25 @@ llamadas hechas hasta ahora en este entorno, no una constante del sistema.
 
 | Metrica | Valor |
 |---|---|
-| Latencia P50 (turno agente, stt+retrieval+llm+tts) | `p50_ms` |
-| Latencia P95 (idem) | `p95_ms` |
-| Tokens de entrada/salida por turno (promedio) | `tokens_in_per_turn` / `tokens_out_per_turn` |
-| Tokens de entrada/salida por llamada (promedio) | `tokens_in_per_call` / `tokens_out_per_call` |
+| Latencia P50 (turno agente, stt+retrieval+llm+tts) | 1814 ms |
+| Latencia P95 (idem) | 10833.4 ms |
+| Tokens de entrada/salida por turno (promedio) | 982.75 / 107.88 |
+| Tokens de entrada/salida por llamada (promedio) | 873.56 / 95.89 |
 | Invocaciones al modelo por turno | 1 (respuesta conversacional) + 1 si el gate de KB disparo esa vuelta -- ver "Decisiones clave"; al cerrar la llamada se suman, una sola vez, clasificacion final + validacion de patologia + resumen narrativo (3 llamadas fijas, no por turno) |
-| Consultas al RAG por llamada (promedio) | `rag_queries_per_call` |
-| Costo estimado por llamada | `est_cost_per_call` (USD) -- metodologia: Phi-3.5-mini corre local, sin costo por token; este numero extrapola los tokens realmente medidos arriba contra el precio publico de `llama-3.1-8b-instant` en Groq (mismo proveedor/familia ya documentado como el swap-target permitido de este proyecto -- ver "Modelo declarado" abajo), $0.05 / 1M tokens entrada, $0.08 / 1M tokens salida (console.groq.com, agosto 2026). Constantes y cita completa en `metrics.go`. |
+| Consultas al RAG por llamada (promedio) | 3.11 |
+| Costo estimado por llamada | $0.0000513 USD -- metodologia: Phi-3.5-mini corre local, sin costo por token; este numero extrapola los tokens realmente medidos arriba contra el precio publico de `llama-3.1-8b-instant` en Groq (mismo proveedor/familia ya documentado como el swap-target permitido de este proyecto -- ver "Modelo declarado" abajo), $0.05 / 1M tokens entrada, $0.08 / 1M tokens salida (console.groq.com, agosto 2026). Constantes y cita completa en `metrics.go`. |
 
-Placeholder de referencia (correr `curl -s http://localhost:8080/api/v1/metrics/summary`
-contra tu propia sesion para los valores reales):
+Snapshot real, capturado con `curl -s http://localhost:8080/api/v1/metrics/summary`
+contra las llamadas de prueba hechas hasta ahora en este entorno -- volvé a correrlo
+contra tu propia sesion antes de citar estos numeros en una entrega nueva, no son una
+constante del sistema:
 
 ```json
 {
-  "p50_ms": 0, "p95_ms": 0,
-  "tokens_in_per_turn": 0, "tokens_out_per_turn": 0,
-  "tokens_in_per_call": 0, "tokens_out_per_call": 0,
-  "rag_queries_per_call": 0, "est_cost_per_call": 0
+  "p50_ms": 1814, "p95_ms": 10833.4,
+  "tokens_in_per_turn": 982.75, "tokens_out_per_turn": 107.875,
+  "tokens_in_per_call": 873.56, "tokens_out_per_call": 95.89,
+  "rag_queries_per_call": 3.111, "est_cost_per_call": 0.0000513
 }
 ```
 
