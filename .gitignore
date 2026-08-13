@@ -504,6 +504,6 @@ pyrightconfig.json
 # large for normal git history. Not committed here; where/how to publish it (GitHub
 # Release, Git LFS, object storage) is a separate decision -- see export_kb_seed.sh's
 # docstring.
-/kb-seed.tar.gz
+# /kb-seed.tar.gz
 /.kb-seed-build/
 /.kb-seed-restore/

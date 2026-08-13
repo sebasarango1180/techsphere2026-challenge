@@ -91,6 +91,7 @@ export default function App() {
   if (phase === 'idle' || phase === 'connecting') {
     return (
       <div className="app-shell">
+        <div className="brand-logo">tqida</div>
         <div className="call-stage">
           <h1>Llamada de seguimiento</h1>
           <p className="subtitle">Presiona el boton para iniciar tu llamada de voz con el asistente.</p>
@@ -138,6 +139,7 @@ export default function App() {
   if (phase === 'reconnect-needed' && call) {
     return (
       <div className="app-shell">
+        <div className="brand-logo">tqida</div>
         <div className="call-stage">
           <h1>Se perdio la conexion</h1>
           <p className="subtitle">Tu llamada sigue activa. Presiona para reconectar.</p>
@@ -158,6 +160,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      <div className="brand-logo">tqida</div>
       <LiveKitRoom
         key={attempt}
         serverUrl={LIVEKIT_URL}

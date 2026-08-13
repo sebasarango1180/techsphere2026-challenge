@@ -426,18 +426,36 @@ async def summarize_call(session: AgentSession, agent: PostSurgicalAgent) -> Non
         kb_chunks = []
     pathology = await _validate_pathology(agent.snapshot, kb_chunks, agent.call_ctx, call_id)
 
+    # classification.get("triage", "verde") is NOT a sufficient guard -- found live: the
+    # model sometimes returns "triage": null explicitly (present key, None value), and
+    # .get()'s default only ever applies to a MISSING key. That None then sails straight
+    # through fuse()'s first branch (which returns model_level UNCHECKED whenever no rule
+    # match exists -- the common case) into db.finalize_triage, where asyncpg casts
+    # Python None to SQL NULL without error (unlike an invalid non-null string, which
+    # WOULD raise on the ::triage_level cast) -- so this failed completely silently,
+    # leaving a call "completed" with a real rationale/pathology assessment but no
+    # final_triage at all. Validate explicitly instead of trusting .get()'s default.
+    model_triage = classification.get("triage")
+    if model_triage not in decision.TRIAGE_ORDER:
+        logger.warning("call_id=%s classification returned invalid/missing triage %r -- defaulting to verde", call_id, model_triage)
+        model_triage = "verde"
+
     # fuse() takes ONE rule match -- agent.worst_rule_match is already the running worst
     # across every turn of the call (app/main.py's on_user_turn_completed), so this is
     # still "max(model, worst rule finding)" over the whole call, not just this pass.
     fused = decision.fuse(
-        classification.get("triage", "verde"),
+        model_triage,
         classification.get("rationale") or f"clasificacion del modelo (confianza={classification.get('confidence', 0)})",
         agent.worst_rule_match,
     )
-    # An explicit empty list from the model ("nothing missing") is meaningful and
-    # different from the key being absent -- `or` would wrongly treat both the same way,
-    # so check for None specifically before falling back to the snapshot's own view.
-    model_missing_info = classification.get("missing_info")
+    # Missing_info is computed from the FINAL, validated snapshot rather than trusted
+    # from the model's own self-report -- found live: the model can be internally
+    # inconsistent within the same JSON response (correctly filling "sleep":
+    # "levemente_alterado" in the structured fields while ALSO listing "sueño" in
+    # "missing_info", contradicting itself). agent.snapshot is the actual source of
+    # truth after enum validation/fuzzy-correction, so it can't disagree with itself the
+    # way raw model output can.
+    model_missing_info = agent.snapshot.missing_fields()
 
     # Map the model's self-reported chunk_id citations back to full {chunk_id,
     # document_id, page} dicts (same shape as insert_escalation's cited_documents) --
@@ -462,7 +480,7 @@ async def summarize_call(session: AgentSession, agent: PostSurgicalAgent) -> Non
         level=fused.level,
         rationale=fused.rationale,
         confidence=classification.get("confidence"),
-        missing_info=model_missing_info if model_missing_info is not None else agent.snapshot.missing_fields(),
+        missing_info=model_missing_info,
         pathology_assessment=_coerce_text(pathology.get("pathology_assessment")),
         pathology_evidence=pathology_evidence,
     )

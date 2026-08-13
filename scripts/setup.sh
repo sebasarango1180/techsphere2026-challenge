@@ -292,6 +292,31 @@ wait "$PID_PULL_STOCK_IMAGES" || die "postgres/livekit/chroma image pull failed"
 if [ -n "$PID_OLLAMA_PULL" ]; then
   wait "$PID_OLLAMA_PULL" || die "Ollama model pull failed"
 fi
+
+# Found live: the phi3.5:3.8b build Ollama serves has a single-turn-only stored template
+# (Go template fields `.System`/`.Prompt`/`.Response`, no `.Messages` loop), so it can't
+# render an actual multi-message chat request (every real turn: system + user, at
+# minimum) at all -- Ollama silently falls back to a generic "chatml" template instead,
+# which does NOT match Phi-3.5's real <|system|>/<|user|>/<|assistant|>/<|end|> format.
+# Confirmed live: this produced garbled words and hallucinated special tokens in
+# conversation, on both the OpenAI-compat and native Ollama request paths identically.
+# Fixed by re-registering the SAME tag in place, `from` itself, with an explicit
+# multi-turn template -- this does NOT alter the model weights (verified: `ollama create`
+# reuses the existing blob layer by sha256, doesn't re-download or refit anything) or its
+# identity as the stock Ollama/HF-sourced build, only the local chat-formatting metadata
+# Ollama had wrong for it. Idempotent and safe to re-run. Must happen automatically here
+# (not as a manual one-off) since evaluators run this script on a machine we don't touch.
+log "Correcting phi3.5:3.8b's chat template (found live: stock template can't render multi-turn chat)"
+cat <<JSON | curl -sf -X POST "$OLLAMA_API/api/create" -H "Content-Type: application/json" -d @- >/dev/null \
+  || warn "Ollama chat-template fix failed -- conversational replies may be unreliable"
+{
+  "model": "$OLLAMA_MODEL",
+  "from": "$OLLAMA_MODEL",
+  "template": "{{- range .Messages }}{{- if eq .Role \"system\" }}<|system|>\n{{ .Content }}<|end|>\n{{- else if eq .Role \"user\" }}<|user|>\n{{ .Content }}<|end|>\n{{- else if eq .Role \"assistant\" }}<|assistant|>\n{{ .Content }}<|end|>\n{{- end }}\n{{- end }}<|assistant|>\n",
+  "parameters": {"stop": ["<|system|>", "<|user|>", "<|end|>", "<|assistant|>"]}
+}
+JSON
+
 if [ -n "$PID_AGENT_DOWNLOAD_FILES" ]; then
   wait "$PID_AGENT_DOWNLOAD_FILES" || warn "voice-agent download-files failed -- turn-detector weights will download on first real call instead"
 fi

@@ -10,6 +10,19 @@
   padding: 40px 24px 64px;
 }
 
+.brand-logo {
+  font-style: italic;
+  font-weight: 800;
+  font-size: 20px;
+  letter-spacing: -0.01em;
+  margin-bottom: 10px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  user-select: none;
+}
+
 h1 {
   font-size: 34px;
   font-weight: 800;
@@ -256,7 +269,7 @@ form.upload-form select:focus {
 
 .signal-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
   gap: 10px;
   margin-top: 18px;
 }
@@ -268,7 +281,10 @@ form.upload-form select:focus {
   padding: 10px 12px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
+  min-width: 0; /* let a grid item shrink below its content's intrinsic width -- without
+                   this, a long enum value can force the chip (and its border) wider
+                   than the grid track instead of wrapping inside it. */
   transition: transform 0.15s ease, border-color 0.15s ease;
 }
 
@@ -278,15 +294,19 @@ form.upload-form select:focus {
 }
 
 .signal-label {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text-muted);
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.05em;
 }
 
 .signal-value {
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 600;
+  font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .missing-info {

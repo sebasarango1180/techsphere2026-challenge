@@ -23,6 +23,7 @@ export default function App() {
 
   return (
     <div className="app-main">
+      <div className="brand-logo">tqida</div>
       <h1>Consola de administracion</h1>
       <div className="tab-bar">
         <button
